@@ -442,8 +442,10 @@ def train():
                     loss.backward()
                 train_loss += loss.float().item()
         else:
+            print(data.shape, data.dtype)
             ret = para_model(data, target, *mems)
             loss, mems = ret[0], ret[1:]
+            print("train 447", loss.shape, len(mems))
             loss = loss.float().mean().type_as(loss)
             if args.fp16:
                 optimizer.backward(loss)

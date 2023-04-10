@@ -607,11 +607,11 @@ class MemTransformerLM(nn.Module):
     def init_mems(self):
         if self.mem_len > 0:
             mems = []
-            param = next(self.parameters())
+            # param = next(self.parameters())
             for i in range(self.n_layer+1):
-                empty = torch.empty(0, dtype=param.dtype, device=param.device)
+                empty = torch.empty(0, dtype=self.dtype, device=self.device)
                 mems.append(empty)
-
+            print("Mems", mems)
             return mems
         else:
             return None
@@ -739,7 +739,9 @@ class MemTransformerLM(nn.Module):
         # So, have to initialize size(0) mems inside the model forward.
         # Moreover, have to return new_mems to allow nn.DataParallel to piece
         # them together.
+        self.device, self.dtype = data.device, data.dtype
         if not mems: mems = self.init_mems()
+        print("===>>>", len(mems), mems[0].shape)
 
         tgt_len = target.size(0)
         hidden, new_mems = self._forward(data, mems=mems)
@@ -751,7 +753,7 @@ class MemTransformerLM(nn.Module):
                 self.out_layer.bias, target, pred_hid, self.sampler)
             loss = -F.log_softmax(logit, -1)[:, :, 0]
         else:
-            loss = self.crit(pred_hid.view(-1, pred_hid.size(-1)), target.view(-1))
+            loss = self.crit(pred_hid.reshape(-1, pred_hid.size(-1)), target.reshape(-1))
             loss = loss.view(tgt_len, -1)
 
         if new_mems is None:
