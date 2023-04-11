@@ -141,14 +141,16 @@ parser.add_argument('--static-loss-scale', type=float, default=1,
 parser.add_argument('--dynamic-loss-scale', action='store_true',
                     help='Use dynamic loss scaling.  If supplied, this argument'
                     ' supersedes --static-loss-scale.')
-args = parser.parse_args()
-args.tied = not args.not_tied
+args = parser.parse_args()  # argument parser, collects input from the user
+args.tied = not args.not_tied  # tied and untied word embeddings with softmax
+# TODO identify the reason of word embedding tied
 
-if args.d_embed < 0:
+if args.d_embed < 0:  # user preferred embedding size
     args.d_embed = args.d_model
 
 assert args.ext_len >= 0, 'extended context length must be non-negative'
-assert args.batch_size % args.batch_chunk == 0
+assert args.batch_size % args.batch_chunk == 0  # batch chunk for model parallelization?
+# the description above says that batch_chunk is needed to save memory
 
 args.work_dir = '{}-{}'.format(args.work_dir, args.dataset)
 args.work_dir = os.path.join(args.work_dir, time.strftime('%Y%m%d-%H%M%S'))
@@ -156,8 +158,8 @@ logging = create_exp_dir(args.work_dir,
     scripts_to_save=['train.py', 'mem_transformer.py'], debug=args.debug)
 
 # Set the random seed manually for reproducibility.
-np.random.seed(args.seed)
-torch.manual_seed(args.seed)
+np.random.seed(args.seed)  # for reproducibility of model results
+torch.manual_seed(args.seed)  # same for torch package
 if torch.cuda.is_available():
     if not args.cuda:
         print('WARNING: You have a CUDA device, so you should probably run with --cuda')
@@ -165,7 +167,7 @@ if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
 # Validate `--fp16` option
-if args.fp16:
+if args.fp16:  # fp16 is the mode for training? I saw this in stable diffusion project
     if not args.cuda:
         print('WARNING: --fp16 requires --cuda, ignoring --fp16 option')
         args.fp16 = False
@@ -181,8 +183,9 @@ device = torch.device('cuda' if args.cuda else 'cpu')
 ###############################################################################
 # Load data
 ###############################################################################
-corpus = get_lm_corpus(args.data, args.dataset)
-ntokens = len(corpus.vocab)
+corpus = get_lm_corpus(args.data, args.dataset)  # text preprocessing. it includes tokenization, word and sentence count
+# encoding values into torch Tensor objects (LongTensor)
+ntokens = len(corpus.vocab)  # number of tokens
 args.n_token = ntokens
 
 eval_batch_size = 10
@@ -195,7 +198,7 @@ te_iter = corpus.get_iterator('test', eval_batch_size, args.eval_tgt_len,
 
 # adaptive softmax / embedding
 cutoffs, tie_projs = [], [False]
-if args.adaptive:
+if args.adaptive:  # adaptive softmax
     assert args.dataset in ['wt103', 'lm1b']
     if args.dataset == 'wt103':
         cutoffs = [20000, 40000, 200000]
@@ -207,14 +210,18 @@ if args.adaptive:
 ###############################################################################
 # Build the model
 ###############################################################################
+
+
 def init_weight(weight):
-    if args.init == 'uniform':
+    if args.init == 'uniform':  # Uniform distribution 1/(b-a)
         nn.init.uniform_(weight, -args.init_range, args.init_range)
-    elif args.init == 'normal':
+    elif args.init == 'normal':  # Normal[Gaussian] distribution
         nn.init.normal_(weight, 0.0, args.init_std)
+
 
 def init_bias(bias):
     nn.init.constant_(bias, 0.0)
+
 
 def weights_init(m):
     classname = m.__class__.__name__
@@ -265,14 +272,15 @@ def update_dropatt(m):
     if hasattr(m, 'dropatt'):
         m.dropatt.p = args.dropatt
 
-if args.restart:
-    with open(os.path.join(args.restart_dir, 'model.pt'), 'rb') as f:
+
+if args.restart:  # restart training from the saved checkpoint
+    with open(os.path.join(args.restart_dir, 'model.pt'), 'rb') as f:  # load checkpoin
         model = torch.load(f)
     if not args.fp16:
         model = model.float()
     model.apply(update_dropout)
     model.apply(update_dropatt)
-else:
+else:  # new model initialization
     model = MemTransformerLM(ntokens, args.n_layer, args.n_head, args.d_model,
         args.d_head, args.d_inner, args.dropout, args.dropatt,
         tie_weight=args.tied, d_embed=args.d_embed, div_val=args.div_val,
@@ -281,7 +289,7 @@ else:
         same_length=args.same_length, attn_type=args.attn_type,
         clamp_len=args.clamp_len, sample_softmax=args.sample_softmax)
     model.apply(weights_init)
-    model.word_emb.apply(weights_init) # ensure embedding init is not overridden by out_layer in case of weight sharing
+    model.word_emb.apply(weights_init)  # ensure embedding init is not overridden by out_layer in case of weight sharing
 args.n_all_param = sum([p.nelement() for p in model.parameters()])
 args.n_nonemb_param = sum([p.nelement() for p in model.layers.parameters()])
 

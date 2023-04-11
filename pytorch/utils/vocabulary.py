@@ -26,7 +26,7 @@ class Vocab(object):
         else:
             symbols = line.split(self.delimiter)
 
-        if add_double_eos: # lm1b
+        if add_double_eos:  # lm1b
             return ['<S>'] + symbols + ['<S>']
         elif add_eos:
             return symbols + ['<eos>']
@@ -34,7 +34,10 @@ class Vocab(object):
             return symbols
 
     def count_file(self, path, verbose=False, add_eos=False):
-        if verbose: print('counting file {} ...'.format(path))
+        # count the number of tokens inside dataset
+        # params: the delimiter, special characters either at both sides or at the end
+        if verbose:  # verbosity, information from the model
+            print('counting file {} ...'.format(path))
         assert os.path.exists(path)
 
         sents = []
@@ -44,7 +47,7 @@ class Vocab(object):
                     print('    line {}'.format(idx))
                 symbols = self.tokenize(line, add_eos=add_eos)
                 self.counter.update(symbols)
-                sents.append(symbols)
+                sents.append(symbols)  # list of lists
 
         return sents
 
@@ -52,7 +55,8 @@ class Vocab(object):
         """
             sents : a list of sentences, each a list of tokenized symbols
         """
-        if verbose: print('counting {} sents ...'.format(len(sents)))
+        if verbose:
+            print('counting {} sents ...'.format(len(sents)))
         for idx, symbols in enumerate(sents):
             if verbose and idx > 0 and idx % 500000 == 0:
                 print('    line {}'.format(idx))
@@ -91,7 +95,8 @@ class Vocab(object):
 
     def encode_file(self, path, ordered=False, verbose=False, add_eos=True,
             add_double_eos=False):
-        if verbose: print('encoding file {} ...'.format(path))
+        if verbose:
+            print('encoding file {} ...'.format(path))
         assert os.path.exists(path)
         encoded = []
         with open(path, 'r', encoding='utf-8') as f:
