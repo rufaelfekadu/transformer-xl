@@ -439,8 +439,36 @@ class RelLearnableDecoderLayer(nn.Module):
         return output
 
 
+from torchgpipe.skip import skippable, stash, pop
+
+
+@skippable(stash=['hidden_states'])
+class RelPartialLearnableDecoderLayerFirst(nn.Module):
+    def __init__(self, n_head, d_model, d_head, d_inner, dropout, index,
+                 **kwargs):
+        super(RelPartialLearnableDecoderLayerFirst, self).__init__()
+
+        self.dec_attn = RelPartialLearnableMultiHeadAttn(n_head, d_model,
+                                                         d_head, dropout, **kwargs)
+        self.pos_ff = PositionwiseFF(d_model, d_inner, dropout,
+                                     pre_lnorm=kwargs.get('pre_lnorm'))
+        self.index = index
+
+    def forward(self, tup):
+        dec_inp, r, r_w_bias, r_r_bias, dec_attn_mask, mems = tup
+        mem_i = mems[self.index]
+        output = self.dec_attn(dec_inp, r, r_w_bias, r_r_bias,
+                               attn_mask=dec_attn_mask,
+                               mems=mem_i)
+        output = self.pos_ff(output)
+        yield stash('hidden_states', output)
+
+        return output
+
+
+@skippable(stash=['hidden_states'], pop=['hidden_states'])
 class RelPartialLearnableDecoderLayer(nn.Module):
-    def __init__(self, n_head, d_model, d_head, d_inner, dropout,
+    def __init__(self, n_head, d_model, d_head, d_inner, dropout, index,
                  **kwargs):
         super(RelPartialLearnableDecoderLayer, self).__init__()
 
@@ -448,14 +476,43 @@ class RelPartialLearnableDecoderLayer(nn.Module):
                                                          d_head, dropout, **kwargs)
         self.pos_ff = PositionwiseFF(d_model, d_inner, dropout,
                                      pre_lnorm=kwargs.get('pre_lnorm'))
+        self.index = index
 
-    def forward(self, dec_inp, r, r_w_bias, r_r_bias, dec_attn_mask=None, mems=None):
+    def forward(self, tup):
+        dec_inp, r, r_w_bias, r_r_bias, dec_attn_mask, mems = tup
+        mem_i = mems[self.index]
         output = self.dec_attn(dec_inp, r, r_w_bias, r_r_bias,
                                attn_mask=dec_attn_mask,
-                               mems=mems)
+                               mems=mem_i)
+        hidden_states = yield pop('hidden_states')
+        yield stash('hidden_state', torch.stack(hidden_states, output))
         output = self.pos_ff(output)
 
         return output
+
+
+@skippable(pop=['hidden_states'])
+class RelPartialLearnableDecoderLayerLast(nn.Module):
+    def __init__(self, n_head, d_model, d_head, d_inner, dropout, index,
+                 **kwargs):
+        super(RelPartialLearnableDecoderLayerLast, self).__init__()
+
+        self.dec_attn = RelPartialLearnableMultiHeadAttn(n_head, d_model,
+                                                         d_head, dropout, **kwargs)
+        self.pos_ff = PositionwiseFF(d_model, d_inner, dropout,
+                                     pre_lnorm=kwargs.get('pre_lnorm'))
+        self.index = index
+
+    def forward(self, tup):
+        dec_inp, r, r_w_bias, r_r_bias, dec_attn_mask, mems = tup
+        mem_i = mems[self.index]
+        output = self.dec_attn(dec_inp, r, r_w_bias, r_r_bias,
+                               attn_mask=dec_attn_mask,
+                               mems=mem_i)
+        output = self.pos_ff(output)
+        hidden_states = yield pop('hidden_states')
+
+        return output, hidden_states
 
 
 class AdaptiveEmbedding(nn.Module):
@@ -528,7 +585,7 @@ class MemTransformerLM(nn.Module):
                  tgt_len=None, ext_len=None, mem_len=None,
                  cutoffs=[], adapt_inp=False,
                  same_length=False, attn_type=0, clamp_len=-1,
-                 sample_softmax=-1):
+                 sample_softmax=-1, pipeline_devices=2):
         super(MemTransformerLM, self).__init__()
         self.n_token = n_token
 
@@ -553,14 +610,25 @@ class MemTransformerLM(nn.Module):
         self.attn_type = attn_type
 
         self.layers = nn.ModuleList()
+
+        self.pipeline_devices = pipeline_devices
         if attn_type == 0:  # the default attention
-            for i in range(n_layer):
+            self.layers.append(RelPartialLearnableDecoderLayerFirst(
+                        n_head, d_model, d_head, d_inner, dropout,
+                        tgt_len=tgt_len, ext_len=ext_len, mem_len=mem_len,
+                        dropatt=dropatt, pre_lnorm=pre_lnorm, index=0))
+            for i in range(1, n_layer-1):
                 self.layers.append(
                     RelPartialLearnableDecoderLayer(
                         n_head, d_model, d_head, d_inner, dropout,
                         tgt_len=tgt_len, ext_len=ext_len, mem_len=mem_len,
-                        dropatt=dropatt, pre_lnorm=pre_lnorm)
+                        dropatt=dropatt, pre_lnorm=pre_lnorm, index=i)
                 )
+            self.layers.append(RelPartialLearnableDecoderLayerLast(
+                n_head, d_model, d_head, d_inner, dropout,
+                tgt_len=tgt_len, ext_len=ext_len, mem_len=mem_len,
+                dropatt=dropatt, pre_lnorm=pre_lnorm, index=-1))
+
         elif attn_type == 1:  # learnable embeddings
             for i in range(n_layer):
                 self.layers.append(
@@ -576,6 +644,8 @@ class MemTransformerLM(nn.Module):
                         n_head, d_model, d_head, d_inner, dropout,
                         dropatt=dropatt, pre_lnorm=pre_lnorm)
                 )
+
+        #########################################################################################################
         from torchgpipe import GPipe
         self.nn_sequential_model = nn.Sequential(*self.layers)
         from torchgpipe.balance import balance_by_time
@@ -598,7 +668,7 @@ class MemTransformerLM(nn.Module):
                 devices=[1, 2, 3],
                 chunks=8
             )
-
+        #########################################################################################################
         self.sample_softmax = sample_softmax
         # use sampled softmax
         if sample_softmax > 0:
@@ -709,33 +779,39 @@ class MemTransformerLM(nn.Module):
             dec_attn_mask = torch.triu(
                 word_emb.new_ones(qlen, klen), diagonal=1 + mlen).byte()[:, :, None]
 
+        #########################################################################################################
         in_device = self.gpipe_model.devices[0]
         out_device = self.gpipe_model.devices[-1]
+        #########################################################################################################
         hids = []
         if self.attn_type == 0:  # default
             pos_seq = torch.arange(klen - 1, -1, -1.0, device=word_emb.device,
                                    dtype=word_emb.dtype)
             if self.clamp_len > 0:
                 pos_seq.clamp_(max=self.clamp_len)
-            pos_emb = self.pos_emb(pos_seq)
+            pos_emb = self.pos_emb(pos_seq)  # positional encoding
 
             core_out = self.drop(word_emb)
-            first_core_out = core_out
-            pos_emb = self.drop(pos_emb)
+            pos_emb = self.drop(pos_emb)  # drop out
+
+            ###################
+            first_core_out = (core_out, pos_emb, self.r_w_bias, self.r_r_bias, dec_attn_mask, mems)
+            ###################
 
             hids.append(core_out)
-            core_outs = []
-            for i, layer in enumerate(self.layers):
-                mems_i = None if mems is None else mems[i]
-                core_outs.append(core_out)
-                core_out = layer(core_out, pos_emb, self.r_w_bias,
-                                 self.r_r_bias, dec_attn_mask=dec_attn_mask, mems=mems_i)
-                hids.append(core_out)
+            # for i, layer in enumerate(self.layers):
+            #     mems_i = None if mems is None else mems[i]
+            #     core_outs.append(core_out)
+            #     core_out = layer(core_out, pos_emb, self.r_w_bias,
+            #                      self.r_r_bias, dec_attn_mask=dec_attn_mask, mems=mems_i)
+            #     hids.append(core_out)
 
-            input_ = first_core_out.to(in_device, non_blocking=True)
-            output = self.gpipe_model(input_)
-
-            assert hids[-1] == output
+            #########################################################################################################
+            # input_ = first_core_out.to(in_device, non_blocking=True)
+            output, hidden_states = self.gpipe_model(first_core_out)
+            hids = hids + list(hidden_states.unbind())
+            hids.append(output)
+            #########################################################################################################
 
         elif self.attn_type == 1:  # learnable
             core_out = self.drop(word_emb)
