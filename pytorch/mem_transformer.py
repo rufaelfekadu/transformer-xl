@@ -635,7 +635,6 @@ class MemTransformerLM(nn.Module):
 
                 cat = torch.cat([mems[i], hids[i]], dim=0)
                 new_mems.append(cat[beg_idx:end_idx].detach())
-            # print("mem_transformer, 636:", mems[i].shape, hids[i].shape)
             
         return new_mems
 

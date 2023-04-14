@@ -65,10 +65,8 @@ class BalancedDataParallel(DataParallel):
         if len(self.device_ids) == 1:
             return self.module(*inputs[0], **kwargs[0])
         replicas = self.replicate(self.module, self.device_ids)
-        # print("Module details:",  [type(m.parameters()) for m in replicas])
         if self.gpu0_bsz == 0:
             replicas = replicas[1:]
-        # print(len(inputs), len(replicas), len(device_ids), [(input[0].device, type(input[0])) for input in inputs], len(inputs[0]))
         outputs = self.parallel_apply(replicas, device_ids, inputs, kwargs)
         return self.gather(outputs, self.output_device)
 

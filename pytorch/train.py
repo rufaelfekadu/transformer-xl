@@ -182,9 +182,7 @@ device = torch.device('cuda' if args.cuda else 'cpu')
 # Load data
 ###############################################################################
 corpus = get_lm_corpus(args.data, args.dataset)
-print('Vocab size : {}'.format(len(corpus.vocab.idx2sym)))
 ntokens = len(corpus.vocab)
-print("Number of tokens:", ntokens)
 args.n_token = ntokens
 
 eval_batch_size = 10
@@ -444,10 +442,8 @@ def train():
                     loss.backward()
                 train_loss += loss.float().item()
         else:
-            # print(data.shape, data.dtype)
             ret = para_model(data, target, *mems)
             loss, mems = ret[0], ret[1:]
-            # print("train 447", loss.shape, (mems[0].shape))
             loss = loss.float().mean().type_as(loss)
             if args.fp16:
                 optimizer.backward(loss)
