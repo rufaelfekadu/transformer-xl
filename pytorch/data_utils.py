@@ -1,11 +1,106 @@
 import os, sys
 import glob
+from typing import Optional, Iterator, Union, Iterable, List
+import math
 
 from collections import Counter, OrderedDict
 import numpy as np
 import torch
+from torch.utils.data import Dataset, DistributedSampler, BatchSampler, Sampler
+from torch.utils.data.distributed import T_co
+import torch.distributed as dist
 
 from utils.vocabulary import Vocab
+
+
+class CustomDataset(Dataset):
+    def __init__(self, data, bptt=512) -> None:
+        super().__init__()
+        self.data = data
+        self.bptt = bptt
+        
+        
+    def __getitem__(self, index):
+        start_idx = index*self.bptt
+        end_idx = (index+1)*self.bptt
+        return self.data[start_idx:end_idx], self.data[start_idx+1:end_idx+1] # data, target
+    
+    def __len__(self):
+        return self.data.shape[0]//self.bptt
+
+class CustomDistributedSampler(DistributedSampler):
+    def __init__(self, dataset: Dataset, batch_size:int, num_replicas: Optional[int] = None, rank: Optional[int] = None, shuffle: bool = True, seed: int = 0, drop_last: bool = False) -> None:
+        super().__init__(dataset, num_replicas, rank, shuffle, seed, drop_last)
+        
+        self.batch_size = batch_size
+    def __iter__(self) -> Iterator[T_co]:
+        if self.shuffle:
+            # deterministically shuffle based on epoch and seed
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            indices = torch.randperm(len(self.dataset), generator=g).tolist()  # type: ignore[arg-type]
+        else:
+            indices = list(range(len(self.dataset)))  # type: ignore[arg-type]
+
+        if not self.drop_last:
+            # add extra samples to make it evenly divisible
+            padding_size = self.total_size - len(indices)
+            if padding_size <= len(indices):
+                indices += indices[:padding_size]
+            else:
+                indices += (indices * math.ceil(padding_size / len(indices)))[:padding_size]
+        else:
+            # remove tail of data to make it evenly divisible.
+            indices = indices[:self.total_size]
+        assert len(indices) == self.total_size
+        world_size = dist.get_world_size()
+        indices_per_rank = len(indices) // world_size
+
+        # subsample
+        rank_start = self.rank * indices_per_rank
+        rank_end = rank_start + indices_per_rank
+        rank_indices = indices[rank_start:rank_end]
+        assert len(rank_indices) == self.num_samples
+        
+        # Rearrange the indices to ensure that for a batch size, b, the i-th axis of successive
+        # batches loaded are contiguous in the original data. This is to make it possible to take
+        # advantage of the memory component. For example, if the following are indices to loaded
+        # by a single device using batch size 4,
+        #  
+        # 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16, 17,
+        # 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+        # 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
+        # 
+        # We will need to transform it as shown below 
+        # 
+        # [ 0, 12, 24, 36,  1, 13, 25, 37,  2, 14, 26, 38,  3, 15, 27, 39,  4, 16,
+        # 28, 40,  5, 17, 29, 41,  6, 18, 30, 42,  7, 19, 31, 43,  8, 20, 32, 44,
+        #  9, 21, 33, 45, 10, 22, 34, 46, 11, 23, 35, 47]
+        # 
+        # this is to ensure that when the first three batches
+        # are processed, they will be in this form:
+        # [0,12,24,36], [1,13,25,37], [2,14,26,38], which shows that the batches first axes data are 
+        # 1,2,3 (i.e, they are contiguous)
+        
+        
+        # Remove excess padding to make it divisible by the batch size
+        if not self.drop_last:
+            padding_size = -len(rank_indices)%self.batch_size
+            rank_indices += rank_indices[:padding_size]
+        else:
+            excess_size = len(rank_indices)%self.batch_size
+            rank_indices = rank_indices[:len(rank_indices)-excess_size]
+        
+        rank_indices = np.array(rank_indices).reshape(self.batch_size, -1).T.flatten()
+
+        return iter(rank_indices)
+
+class CustomBatchSampler(BatchSampler):
+    def __init__(self, sampler: Union[Sampler[int], Iterable[int]], batch_size: int, drop_last: bool) -> None:
+        super().__init__(sampler, batch_size, drop_last)
+    def __iter__(self) -> Iterator[List[int]]:
+        return super().__iter__()
+        
 
 class LMOrderedIterator(object):
     def __init__(self, data, bsz, bptt, device='cpu', ext_len=None):
@@ -23,6 +118,7 @@ class LMOrderedIterator(object):
 
         # Trim off any extra elements that wouldn't cleanly fit (remainders).
         data = data.narrow(0, 0, self.n_step * bsz)
+        # print(data.shape)
 
         # Evenly divide the data across the bsz batches.
         self.data = data.view(bsz, -1).t().contiguous().to(device)
@@ -31,11 +127,13 @@ class LMOrderedIterator(object):
         self.n_batch = (self.n_step + self.bptt - 1) // self.bptt
 
     def get_batch(self, i, bptt=None):
+        # print("bptt", bptt)
         if bptt is None: bptt = self.bptt
         seq_len = min(bptt, self.data.size(0) - 1 - i)
 
         end_idx = i + seq_len
         beg_idx = max(0, i - self.ext_len)
+        # print(beg_idx, self.ext_len, self.data.shape, self.bsz)
 
         data = self.data[beg_idx:end_idx]
         target = self.data[i+1:i+1+seq_len]
@@ -231,6 +329,13 @@ class Corpus(object):
                 data_iter = LMShuffledIterator(data, *args, **kwargs)
 
         return data_iter
+    
+    def get_dataset(self, split, *args, **kwargs):
+        if split=='train':
+            return CustomDataset(self.train, *args, **kwargs)
+        elif split in ["valid", "test"]:
+            data = self.valid if split == 'valid' else self.test
+            return CustomDataset(data)
 
 
 def get_lm_corpus(datadir, dataset):
@@ -262,12 +367,38 @@ def get_lm_corpus(datadir, dataset):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='unit test')
-    parser.add_argument('--datadir', type=str, default='../data/text8',
+    parser.add_argument('--datadir', type=str, default='./data/enwik8',
                         help='location of the data corpus')
-    parser.add_argument('--dataset', type=str, default='text8',
+    parser.add_argument('--dataset', type=str, default='enwik8',
                         choices=['ptb', 'wt2', 'wt103', 'lm1b', 'enwik8', 'text8'],
                         help='dataset name')
     args = parser.parse_args()
-
+    import pathlib
+    print(pathlib.Path(args.datadir).exists())
     corpus = get_lm_corpus(args.datadir, args.dataset)
     print('Vocab size : {}'.format(len(corpus.vocab.idx2sym)))
+    iterator = corpus.get_iterator("train", 22, 512, device=torch.device("cuda"), ext_len=0)
+    for i, (data, target, seq_len) in enumerate(iterator):
+        print(data[1, :3], target[:5, :3], sep='\n')
+        
+        if i==0: break
+    
+    dataset = corpus.get_dataset("train")
+    print("Length of dataset:", len(dataset))
+    
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12356'
+    
+    # for i in range(4):
+    #     print("Rank:", i)
+    dist.init_process_group("nccl", rank=0, world_size=1)
+        # print("Rank done", i)
+    print("creating sampler instance")
+    sampler = CustomDistributedSampler(dataset, shuffle=False, rank=0)
+    print("sampling...")
+    for i in sampler:
+        print(i)
+        if i >10:
+            break
+    dist.destroy_process_group()
+    # print(all(dataset[0][0]==data.cpu()[:,0]))

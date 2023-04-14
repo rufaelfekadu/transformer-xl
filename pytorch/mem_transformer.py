@@ -611,7 +611,6 @@ class MemTransformerLM(nn.Module):
             for i in range(self.n_layer+1):
                 empty = torch.empty(0, dtype=self.dtype, device=self.device)
                 mems.append(empty)
-            print("Mems", mems)
             return mems
         else:
             return None
@@ -636,7 +635,8 @@ class MemTransformerLM(nn.Module):
 
                 cat = torch.cat([mems[i], hids[i]], dim=0)
                 new_mems.append(cat[beg_idx:end_idx].detach())
-
+            # print("mem_transformer, 636:", mems[i].shape, hids[i].shape)
+            
         return new_mems
 
     def _forward(self, dec_inp, mems=None):
@@ -741,7 +741,6 @@ class MemTransformerLM(nn.Module):
         # them together.
         self.device, self.dtype = data.device, data.dtype
         if not mems: mems = self.init_mems()
-        print("===>>>", len(mems), mems[0].shape)
 
         tgt_len = target.size(0)
         hidden, new_mems = self._forward(data, mems=mems)
