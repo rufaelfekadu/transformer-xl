@@ -3,7 +3,7 @@
 if [[ $1 == 'train' ]]; then
     echo 'Run training...'
     /home/ridwan/.conda/envs/transformerxl/bin/python \
-        train.py \
+        train_fsdp.py \
         --cuda \
         --data ../data/enwik8/ \
         --dataset enwik8 \
