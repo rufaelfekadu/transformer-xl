@@ -1,4 +1,4 @@
-import os
+import os, sys
 import math
 import time
 import argparse
@@ -153,8 +153,8 @@ def train(args, model, rank, world_size, train_loader, valid_loader, optimizer, 
             ddp_loss = torch.zeros(1).to(rank)
             init_start_event.record()
             
-        if train_step >= args.max_step:
-            break
+        if cur_loss <= 1.0 or train_step >= args.max_step:
+            sys.exit(os.EX_OK)
 
 
 def evaluate(model, rank, world_size, test_loader, train_step, optimizer, args):

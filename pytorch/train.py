@@ -550,7 +550,7 @@ def train():
 
             eval_start_time = time.time()
 
-        if train_step == args.max_step:
+        if train_step >= args.max_step or cur_loss <=1.0:
             break
         
         if train_step % args.log_interval == 0:
@@ -570,7 +570,7 @@ try:
         epoch_start = time.time()
         train()
         wandb.log({"epoch": epoch, "epoch_duration": (time.time() - epoch_start)})
-        if train_step == args.max_step:
+        if train_step >= args.max_step:
             logging('-' * 100)
             logging('End of training')
             break
