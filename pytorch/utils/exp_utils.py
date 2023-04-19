@@ -51,6 +51,6 @@ def init_wandb(run_name, run_cfg):
         name=run_name
     )
     
-    if run_cfg.debug:
-        wandb.log = get_logger(log_path=os.path.join(run_cfg.work_dir, 'wandb_local_metrics.txt'))
+    # if run_cfg.debug:
+    #     wandb.log = get_logger(log_path=os.path.join(run_cfg.work_dir, 'wandb_local_metrics.txt'))
     return wandb

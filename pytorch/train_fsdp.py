@@ -18,10 +18,12 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.fully_sharded_data_parallel import (
-    CPUOffload,
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
     BackwardPrefetch,
+    ShardingStrategy,
+    CPUOffload
 )
 from torch.distributed.fsdp.wrap import (
     size_based_auto_wrap_policy,
@@ -38,7 +40,7 @@ from utils.exp_utils import create_exp_dir, init_wandb
 lead_device=0
 
 eval_batch_size = 10
-best_val_loss = None
+best_val_loss = float("inf")
 def init_model(args):
     cutoffs, tie_projs = [], [False]
 
@@ -57,7 +59,7 @@ def init_model(args):
 def setup(rank, world_size):
     import random
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = f"{123}{random.randint(10,99)}"
+    os.environ['MASTER_PORT'] = 12355#f"{123}{random.randint(10,99)}"
 
     # initialize the process group
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
@@ -81,6 +83,7 @@ def train(args, model, rank, world_size, train_loader, valid_loader, optimizer, 
     
     init_start_event.record()
     prev_loss = 0
+    start = time.time()
     for batch, (data, target) in enumerate(train_loader):
         
         data, target = data.T.to(rank), target.T.to(rank)
@@ -141,16 +144,17 @@ def train(args, model, rank, world_size, train_loader, valid_loader, optimizer, 
             log_obj.update({"goodput": log_obj["throughput"] * log_obj["stat_eff"]})
             wandb.log(log_obj)
             prev_loss = cur_loss
+            print("Duration:", time.time()-start)
             
-        if train_step % args.log_interval == 0:
-            ddp_loss = torch.zeros(1).to(rank)
-            init_start_event.record()
-
         if train_step % args.eval_interval == 0:
             evaluate(model, rank, world_size, valid_loader, train_step, optimizer, args)
             # Switch back to the training mode
             model.reset_length(args.tgt_len, args.ext_len, args.mem_len)
             model.train()
+            
+        if train_step % args.log_interval == 0:
+            ddp_loss = torch.zeros(1).to(rank)
+            init_start_event.record()
 
 
 def evaluate(model, rank, world_size, test_loader, train_step, optimizer, args):
@@ -214,7 +218,7 @@ def fsdp_main(rank, world_size, args, corpus):
     wandb=None
     if rank==lead_device:
         print("Initializing Weights and Biases...")
-        wandb = init_wandb(run_name=f"fsdp_exp_{args.timestamp}", run_cfg=args)
+        wandb = init_wandb(run_name=f"fsdp_exp_full_shard{args.timestamp}", run_cfg=args)
     setup(rank, world_size)
     
     train_dataset = corpus.get_dataset("train")
@@ -253,7 +257,7 @@ def fsdp_main(rank, world_size, args, corpus):
 
     model = init_model(args).to(rank)
 
-    model = FSDP(model, device_id=torch.cuda.current_device())
+    model = FSDP(model, device_id=torch.cuda.current_device(), sharding_strategy=ShardingStrategy.FULL_SHARD)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     # if args.cuda and args.fp16:
@@ -301,10 +305,16 @@ if __name__ == '__main__':
     ntokens = len(corpus.vocab)
     args.n_token = ntokens
 
+    sharding_strategy_map = {
+        "full_shard":ShardingStrategy.FULL_SHARD,
+        "grad_op":ShardingStrategy.SHARD_GRAD_OP,
+        "no_shard":ShardingStrategy.NO_SHARD,
+        "hybrid":ShardingStrategy.HYBRID_SHARD,
+        "hybrid_grad_op":ShardingStrategy._HYBRID_SHARD_ZERO2}
     # Training settings
     torch.cuda.manual_seed_all(args.seed)
     train_step_ = 0
-    best_val_loss = None
+    # best_val_loss = None
     WORLD_SIZE = torch.cuda.device_count() if args.multi_gpu else 1
 
     try:

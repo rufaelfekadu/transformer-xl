@@ -517,7 +517,7 @@ def train():
             prev_loss = cur_loss
             
             train_loss = 0
-            log_start_time = time.time()
+            
 
         if train_step % args.eval_interval == 0:
             val_loss = evaluate(valid_loader)
@@ -551,6 +551,9 @@ def train():
 
         if train_step == args.max_step:
             break
+        
+        if train_step % args.log_interval == 0:
+            log_start_time = time.time()
 
 # Loop over epochs.
 train_step = 0
