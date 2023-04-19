@@ -509,9 +509,10 @@ def train():
             log_obj = {
                 "train_loss":loss, 
                 "train_step":train_step, 
-                "iter_duration":elapsed*1000/args.log_interval,
-                "throughput": (train_loader.batch_size)/(elapsed*1000 / args.log_interval),
-                "stat_eff": abs(prev_loss - cur_loss)/args.log_interval}
+                "iter_duration":elapsed/args.log_interval,
+                "throughput": (train_loader.batch_size)/(elapsed / args.log_interval),
+                "stat_eff": abs(prev_loss - cur_loss)/args.log_interval,
+                "samples_processed": train_step * train_loader.batch_size}
             log_obj.update({"goodput": log_obj["throughput"] * log_obj["stat_eff"]})
             wandb.log(log_obj)
             prev_loss = cur_loss

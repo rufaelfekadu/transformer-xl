@@ -29,9 +29,10 @@ from torch.distributed.fsdp.wrap import (
     size_based_auto_wrap_policy,
     enable_wrap,
     wrap,
+    transformer_auto_wrap_policy,
 )
 
-from mem_transformer import MemTransformerLM
+from mem_transformer import MemTransformerLM, RelPartialLearnableDecoderLayer
 from custom_parser import arguments
 from data_utils import get_lm_corpus, CustomDistributedSampler
 from utils.weight_init import  weights_init
@@ -59,7 +60,7 @@ def init_model(args):
 def setup(rank, world_size):
     import random
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = 12355#f"{123}{random.randint(10,99)}"
+    os.environ['MASTER_PORT'] = "12355"#f"{123}{random.randint(10,99)}"
 
     # initialize the process group
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
@@ -85,7 +86,7 @@ def train(args, model, rank, world_size, train_loader, valid_loader, optimizer, 
     prev_loss = 0
     start = time.time()
     for batch, (data, target) in enumerate(train_loader):
-        
+        if rank==1: print(batch,end="")
         data, target = data.T.to(rank), target.T.to(rank)
         
         # Ensure that the batch axis of data matches that of mem
@@ -95,10 +96,7 @@ def train(args, model, rank, world_size, train_loader, valid_loader, optimizer, 
         ret = model(data, target, *mems)
         loss, mems = ret[0], ret[1:]
         loss = loss.float().mean().type_as(loss)
-        if args.fp16:
-            optimizer.backward(loss)
-        else:
-            loss.backward()
+        loss.backward()
             
         ddp_loss[0] += loss.item()
 
@@ -123,9 +121,9 @@ def train(args, model, rank, world_size, train_loader, valid_loader, optimizer, 
         dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM) if train_step % args.log_interval == 0 else None
         
         init_end_event.record()
+        dist.barrier()
         if rank==lead_device and train_step % args.log_interval == 0:
             cur_loss = ddp_loss[0] / args.log_interval
-            dist.barrier()
             # if rank==lead_device:
             logging = create_exp_dir(args.work_dir)
             elapsed = init_start_event.elapsed_time(init_end_event)
@@ -138,9 +136,10 @@ def train(args, model, rank, world_size, train_loader, valid_loader, optimizer, 
             log_obj = {
                 "train_loss":loss, 
                 "train_step":train_step, 
-                "iter_duration":elapsed/args.log_interval,
-                "throughput": (world_size * train_loader.batch_size)/(elapsed / args.log_interval),
-                "stat_eff": abs(prev_loss - cur_loss)/args.log_interval}
+                "iter_duration":(elapsed/1000)/args.log_interval,
+                "throughput": (world_size * train_loader.batch_size)/(elapsed/ 1000 / args.log_interval),
+                "stat_eff": abs(prev_loss - cur_loss)/args.log_interval,
+                "samples_processed": train_step * train_loader.batch_size * world_size}
             log_obj.update({"goodput": log_obj["throughput"] * log_obj["stat_eff"]})
             wandb.log(log_obj)
             prev_loss = cur_loss
@@ -217,8 +216,10 @@ def evaluate(model, rank, world_size, test_loader, train_step, optimizer, args):
 def fsdp_main(rank, world_size, args, corpus):
     wandb=None
     if rank==lead_device:
-        print("Initializing Weights and Biases...")
-        wandb = init_wandb(run_name=f"fsdp_exp_full_shard{args.timestamp}", run_cfg=args)
+        wandb = init_wandb(
+            run_name=f"{args.strategy}_bs-{args.batch_size}_ws-{world_size}_bfp-{args.fp16}_wrap-{args.wrap}",
+            run_cfg=args
+        )
     setup(rank, world_size)
     
     train_dataset = corpus.get_dataset("train")
@@ -244,20 +245,18 @@ def fsdp_main(rank, world_size, args, corpus):
     train_loader = DataLoader(train_dataset,**train_kwargs)
     valid_loader = DataLoader(valid_dataset, **valid_kwargs)
     
-    # tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len,
-    #     device=rank, ext_len=args.ext_len)
-    # va_iter = corpus.get_iterator('valid', eval_batch_size, args.eval_tgt_len,
-    #     device=rank, ext_len=args.ext_len)
-    
-    my_auto_wrap_policy = functools.partial(
-        size_based_auto_wrap_policy, min_num_params=100
-    )
     torch.cuda.set_device(rank)
 
 
     model = init_model(args).to(rank)
 
-    model = FSDP(model, device_id=torch.cuda.current_device(), sharding_strategy=ShardingStrategy.FULL_SHARD)
+    model = FSDP(
+        model,
+        device_id=torch.cuda.current_device(),
+        sharding_strategy=args.strategy_obj,
+        auto_wrap_policy=args.wrap_obj,
+        mixed_precision=args.fp16_obj
+    )
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     # if args.cuda and args.fp16:
@@ -311,6 +310,22 @@ if __name__ == '__main__':
         "no_shard":ShardingStrategy.NO_SHARD,
         "hybrid":ShardingStrategy.HYBRID_SHARD,
         "hybrid_grad_op":ShardingStrategy._HYBRID_SHARD_ZERO2}
+    
+    args.strategy_obj = sharding_strategy_map[args.strategy]
+    
+    bfSixteen = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        # Gradient communication precision.
+        reduce_dtype=torch.bfloat16,
+        # Buffer precision.
+        buffer_dtype=torch.bfloat16,
+    )
+    args.fp16_obj = bfSixteen if args.fp16 else None
+    tx_xl_auto_wrap_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls=RelPartialLearnableDecoderLayer
+    )
+    args.wrap_obj = tx_xl_auto_wrap_policy if args.wrap else None
     # Training settings
     torch.cuda.manual_seed_all(args.seed)
     train_step_ = 0

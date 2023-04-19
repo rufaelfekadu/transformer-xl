@@ -127,6 +127,11 @@ def arguments():
     parser.add_argument('--dynamic-loss-scale', action='store_true',
                         help='Use dynamic loss scaling.  If supplied, this argument'
                         ' supersedes --static-loss-scale.')
+    parser.add_argument('--strategy', type=str, default='full_shard',
+                        choices=['full_shard', 'grad_op', 'no_shard', 'hybrid', 'hybrid_grad_op'],
+                        help='Parallel sharding strategy')
+    parser.add_argument('--wrap', action='store_true',
+                        help='Run in fp16 mode.')
     args = parser.parse_args()
     args.tied = not args.not_tied
     
