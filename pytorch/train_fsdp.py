@@ -154,7 +154,7 @@ def train(args, model, rank, world_size, train_loader, valid_loader, optimizer, 
             init_start_event.record()
             
         if prev_loss <= 1.0 or train_step >= args.max_step:
-            sys.exit(os.EX_OK)
+            sys.exit()
 
 
 def evaluate(model, rank, world_size, test_loader, train_step, optimizer, args):
@@ -275,7 +275,10 @@ def fsdp_main(rank, world_size, args, corpus):
     
     for epoch in itertools.count(start=1):
         init_start_event.record()
-        train(args, model, rank, world_size, train_loader, valid_loader, optimizer, scheduler, epoch, wandb, train_sampler)
+        try:
+            train(args, model, rank, world_size, train_loader, valid_loader, optimizer, scheduler, epoch, wandb, train_sampler)
+        except SystemExit:
+            print("Ending training...")
         dist.barrier()
         init_end_event.record()
         if rank==lead_device:
