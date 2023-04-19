@@ -6,7 +6,7 @@ import math
 from collections import Counter, OrderedDict
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DistributedSampler, BatchSampler, Sampler
+from torch.utils.data import Dataset, DistributedSampler, BatchSampler, Sampler, DataLoader
 from torch.utils.data.distributed import T_co
 import torch.distributed as dist
 
@@ -335,7 +335,7 @@ class Corpus(object):
             return CustomDataset(self.train, *args, **kwargs)
         elif split in ["valid", "test"]:
             data = self.valid if split == 'valid' else self.test
-            return CustomDataset(data)
+            return CustomDataset(data, *args, **kwargs)
 
 
 def get_lm_corpus(datadir, dataset):
@@ -367,7 +367,7 @@ def get_lm_corpus(datadir, dataset):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='unit test')
-    parser.add_argument('--datadir', type=str, default='./data/enwik8',
+    parser.add_argument('--datadir', type=str, default='../data/enwik8',
                         help='location of the data corpus')
     parser.add_argument('--dataset', type=str, default='enwik8',
                         choices=['ptb', 'wt2', 'wt103', 'lm1b', 'enwik8', 'text8'],
@@ -378,27 +378,36 @@ if __name__ == '__main__':
     corpus = get_lm_corpus(args.datadir, args.dataset)
     print('Vocab size : {}'.format(len(corpus.vocab.idx2sym)))
     iterator = corpus.get_iterator("train", 22, 512, device=torch.device("cuda"), ext_len=0)
-    for i, (data, target, seq_len) in enumerate(iterator):
-        print(data[1, :3], target[:5, :3], sep='\n')
+    # for i, (data, target, seq_len) in enumerate(iterator):
+    #     print(data[1, :3], target[:5, :3], sep='\n')
         
-        if i==0: break
+        # if i==0: break
     
     dataset = corpus.get_dataset("train")
     print("Length of dataset:", len(dataset))
+    print("Length of data:", dataset.data.shape)
     
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12356'
     
-    # for i in range(4):
-    #     print("Rank:", i)
+    # # for i in range(4):
+    # #     print("Rank:", i)
     dist.init_process_group("nccl", rank=0, world_size=1)
         # print("Rank done", i)
     print("creating sampler instance")
-    sampler = CustomDistributedSampler(dataset, shuffle=False, rank=0)
-    print("sampling...")
-    for i in sampler:
-        print(i)
+    sampler = CustomDistributedSampler(dataset, shuffle=False, drop_last=True, batch_size=22)
+    d1, t1, _ = next(iter(iterator))
+    train_kwargs = {"batch_size": 22, "drop_last":True}
+    dataloader = DataLoader(dataset,**train_kwargs, shuffle=False)
+    
+    print("Number of sequences from custom", len(sampler))
+    
+    i=0
+    for i, ((d2, t2), (d1, t1, _)) in enumerate(zip(dataloader, iterator)) :
+        # for d1, t1, _ in iterator:
+        # print(d2.T.sum(dim=0), d1.sum(dim=0), sep="\n", end="\n###\n")
         if i >10:
             break
+        
     dist.destroy_process_group()
     # print(all(dataset[0][0]==data.cpu()[:,0]))

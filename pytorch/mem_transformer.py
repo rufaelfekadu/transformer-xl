@@ -734,11 +734,14 @@ class MemTransformerLM(nn.Module):
         return core_out, new_mems
 
     def forward(self, data, target, *mems):
+        # print("737 mem_transformer.py: data.shape in forward", data.sum(dim=0))
+        # sys.exit()
         # nn.DataParallel does not allow size(0) tensors to be broadcasted.
         # So, have to initialize size(0) mems inside the model forward.
         # Moreover, have to return new_mems to allow nn.DataParallel to piece
         # them together.
         self.device, self.dtype = data.device, data.dtype
+        # print(self.device)
         if not mems: mems = self.init_mems()
 
         tgt_len = target.size(0)

@@ -11,15 +11,17 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from data_utils import get_lm_corpus
+from data_utils import get_lm_corpus, CustomDataset
 from mem_transformer import MemTransformerLM
-from utils.exp_utils import create_exp_dir
+from utils.exp_utils import create_exp_dir, init_wandb
 from utils.data_parallel import BalancedDataParallel
+
+from torch.utils.data import DataLoader
 
 parser = argparse.ArgumentParser(description='PyTorch Transformer Language Model')
 parser.add_argument('--data', type=str, default='../data/wikitext-103',
                     help='location of the data corpus')
-parser.add_argument('--dataset', type=str, default='wt103',
+parser.add_argument('--dataset', type=str, default='enwik8',
                     choices=['wt103', 'lm1b', 'enwik8', 'text8'],
                     help='dataset name')
 parser.add_argument('--n_layer', type=int, default=12,
@@ -98,7 +100,7 @@ parser.add_argument('--pre_lnorm', action='store_true',
                     help='apply LayerNorm to the input instead of the output')
 parser.add_argument('--varlen', action='store_true',
                     help='use variable length')
-parser.add_argument('--multi_gpu', action='store_true',
+parser.add_argument('--multi_gpu', action=argparse.BooleanOptionalAction,
                     help='use multiple GPU')
 parser.add_argument('--log-interval', type=int, default=200,
                     help='report interval')
@@ -151,7 +153,8 @@ assert args.ext_len >= 0, 'extended context length must be non-negative'
 assert args.batch_size % args.batch_chunk == 0
 
 args.work_dir = '{}-{}'.format(args.work_dir, args.dataset)
-args.work_dir = os.path.join(args.work_dir, time.strftime('%Y%m%d-%H%M%S'))
+args.timestamp = time.strftime('%Y%m%d-%H%M%S')
+args.work_dir = os.path.join(args.work_dir, args.timestamp)
 logging = create_exp_dir(args.work_dir,
     scripts_to_save=['train.py', 'mem_transformer.py'], debug=args.debug)
 
@@ -181,11 +184,14 @@ device = torch.device('cuda' if args.cuda else 'cpu')
 ###############################################################################
 # Load data
 ###############################################################################
+print("184 train.py", args.data, args.dataset)
 corpus = get_lm_corpus(args.data, args.dataset)
 ntokens = len(corpus.vocab)
 args.n_token = ntokens
 
 eval_batch_size = 10
+print("190 train.py:", 'train', args.batch_size, args.tgt_len,
+    device, args.ext_len)
 tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len,
     device=device, ext_len=args.ext_len)
 va_iter = corpus.get_iterator('valid', eval_batch_size, args.eval_tgt_len,
@@ -400,14 +406,16 @@ def evaluate(eval_iter):
     total_len, total_loss = 0, 0.
     with torch.no_grad():
         mems = tuple()
-        for i, (data, target, seq_len) in enumerate(eval_iter):
+        # for i, (data, target, seq_len) in enumerate(eval_iter):
+        for i, (data, target) in enumerate(eval_iter):
+            data, target = data.T.to(device), target.T.to(device)
             if args.max_eval_steps > 0 and i >= args.max_eval_steps:
                 break
             ret = model(data, target, *mems)
             loss, mems = ret[0], ret[1:]
             loss = loss.mean()
-            total_loss += seq_len * loss.float().item()
-            total_len += seq_len
+            total_loss += args.eval_tgt_len * loss.float().item()
+            total_len += args.eval_tgt_len
 
     # Switch back to the training mode
     model.reset_length(args.tgt_len, args.ext_len, args.mem_len)
@@ -415,6 +423,12 @@ def evaluate(eval_iter):
 
     return total_loss / total_len
 
+#####################################################
+train_loader = DataLoader(dataset = corpus.get_dataset("train", args.tgt_len), batch_size=args.batch_size)
+valid_loader = DataLoader(dataset = corpus.get_dataset("train", args.eval_tgt_len), batch_size=eval_batch_size)
+test_loader = DataLoader(dataset = corpus.get_dataset("test", args.eval_tgt_len), batch_size=eval_batch_size)
+#####################################################
+wandb = init_wandb(f"baseline_{args.timestamp}", args)
 
 def train():
     # Turn on training mode which enables dropout.
@@ -425,7 +439,10 @@ def train():
     else:
         mems = tuple()
     train_iter = tr_iter.get_varlen_iter() if args.varlen else tr_iter
-    for batch, (data, target, seq_len) in enumerate(train_iter):
+    prev_loss = 0
+    # for batch, (data, target, seq_len) in enumerate(train_iter):
+    for batch, (data, target) in enumerate(train_loader):
+        data, target = data.T.to(device), target.T.to(device)
         model.zero_grad()
         if args.batch_chunk > 1:
             data_chunks = torch.chunk(data, args.batch_chunk, 1)
@@ -489,11 +506,21 @@ def train():
             else:
                 log_str += ' | ppl {:9.3f}'.format(math.exp(cur_loss))
             logging(log_str)
+            log_obj = {
+                "train_loss":loss, 
+                "train_step":train_step, 
+                "iter_duration":elapsed*1000/args.log_interval,
+                "throughput": (train_loader.batch_size)/(elapsed*1000 / args.log_interval),
+                "stat_eff": abs(prev_loss - cur_loss)/args.log_interval}
+            log_obj.update({"goodput": log_obj["throughput"] * log_obj["stat_eff"]})
+            wandb.log(log_obj)
+            prev_loss = cur_loss
+            
             train_loss = 0
             log_start_time = time.time()
 
         if train_step % args.eval_interval == 0:
-            val_loss = evaluate(va_iter)
+            val_loss = evaluate(valid_loader)
             logging('-' * 100)
             log_str = '| Eval {:3d} at step {:>8d} | time: {:5.2f}s ' \
                       '| valid loss {:5.2f}'.format(
@@ -536,7 +563,9 @@ eval_start_time = time.time()
 # At any point you can hit Ctrl + C to break out of training early.
 try:
     for epoch in itertools.count(start=1):
+        epoch_start = time.time()
         train()
+        wandb.log({"epoch": epoch, "epoch_duration": (time.time() - epoch_start)})
         if train_step == args.max_step:
             logging('-' * 100)
             logging('End of training')
@@ -551,7 +580,7 @@ with open(os.path.join(args.work_dir, 'model.pt'), 'rb') as f:
 para_model = model.to(device)
 
 # Run on test data.
-test_loss = evaluate(te_iter)
+test_loss = evaluate(test_loader)
 logging('=' * 100)
 if args.dataset in ['enwik8', 'text8']:
     logging('| End of training | test loss {:5.2f} | test bpc {:9.5f}'.format(

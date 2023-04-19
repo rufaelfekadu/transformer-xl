@@ -1,8 +1,10 @@
 import functools
 import os, shutil
+from datetime import datetime
+import random
 
 import numpy as np
-
+import wandb
 import torch
 
 
@@ -38,3 +40,17 @@ def create_exp_dir(dir_path, scripts_to_save=None, debug=False):
 def save_checkpoint(model, optimizer, path, epoch):
     torch.save(model, os.path.join(path, 'model_{}.pt'.format(epoch)))
     torch.save(optimizer.state_dict(), os.path.join(path, 'optimizer_{}.pt'.format(epoch)))
+
+def init_wandb(run_name, run_cfg):
+    # start a new wandb run to track this script
+
+    wandb.init(
+        project="fsdp",
+        config=run_cfg,
+        entity="ridzy619",
+        name=run_name
+    )
+    
+    if run_cfg.debug:
+        wandb.log = get_logger(log_path=os.path.join(run_cfg.dir_path, 'wandb_local_metrics.txt'))
+    return wandb
