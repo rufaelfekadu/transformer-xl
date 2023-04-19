@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: amir-pod-project-10
+spec:
+  restartPolicy: Never
+  containers:
+    - name: cuda-container
+      image: '192.168.62.116:5000/pytorch/pytorch:1.7.0-cuda11.0-cudnn8-devel'
+      command: ["python"]
+      args: [
+        "/code/pytorch/train.py",
+        "--cuda",
+        "--multi_gpu",
+        "--data",  "/code/data/enwik8/",
+        "--dataset",  "enwik8",
+        "--n_layer",  "12",
+        "--d_model",  "512",
+        "--n_head",  "8",
+        "--d_head",  "64",
+        "--d_inner",  "2048",
+        "--dropout", "0.1",
+        "--dropatt", "0.0",
+        "--optim",  "adam",
+        "--lr", "0.00025",
+        "--warmup_step",  "0",
+        "--max_step",  "400000",
+        "--tgt_len",  "512",
+        "--mem_len",  "512",
+        "--eval_tgt_len",  "128",
+        "--batch_size",  "22",
+        "--gpu0_bsz",  "4",
+        "--seed", "34"
+        ]
+      resources:
+        limits:
+          nvidia.com/gpu: 4
+      volumeMounts:
+        - mountPath: /code
+          name: volume
+  volumes:
+    - name: volume
+      hostPath:
+        path: /home/amirbek/project/transformer-xl

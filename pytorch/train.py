@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from data_utils import get_lm_corpus
-from mem_transformer import MemTransformerLM
+from mem_transformer_operator import MemTransformerLM
 from utils.exp_utils import create_exp_dir
 from utils.data_parallel import BalancedDataParallel
 
@@ -156,6 +156,7 @@ args.work_dir = '{}-{}'.format(args.work_dir, args.dataset)
 args.work_dir = os.path.join(args.work_dir, time.strftime('%Y%m%d-%H%M%S'))
 logging = create_exp_dir(args.work_dir,
     scripts_to_save=['train.py', 'mem_transformer.py'], debug=args.debug)
+    # scripts_to_save=['/code/pytorch/train.py', '/code/pytorch/mem_transformer.py'], debug=args.debug)
 
 # Set the random seed manually for reproducibility.
 np.random.seed(args.seed)  # for reproducibility of model results
@@ -178,7 +179,7 @@ if args.fp16:  # fp16 is the mode for training? I saw this in stable diffusion p
             print('WARNING: apex not installed, ignoring --fp16 option')
             args.fp16 = False
 
-device = torch.device('cuda' if args.cuda else 'cpu')
+device = torch.device('cuda:1' if args.cuda else 'cpu')
 
 ###############################################################################
 # Load data
@@ -291,7 +292,7 @@ else:  # new model initialization
     model.apply(weights_init)
     model.word_emb.apply(weights_init)  # ensure embedding init is not overridden by out_layer in case of weight sharing
 args.n_all_param = sum([p.nelement() for p in model.parameters()])
-args.n_nonemb_param = sum([p.nelement() for p in model.layers.parameters()])
+# args.n_nonemb_param = sum([p.nelement() for p in model.layers.parameters()])
 
 if args.fp16:
     model = model.half()
@@ -385,7 +386,7 @@ for k, v in args.__dict__.items():
     logging('    - {} : {}'.format(k, v))
 logging('=' * 100)
 logging('#params = {}'.format(args.n_all_param))
-logging('#non emb params = {}'.format(args.n_nonemb_param))
+# logging('#non emb params = {}'.format(args.n_nonemb_param))
 
 ###############################################################################
 # Training code
