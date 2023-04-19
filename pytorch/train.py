@@ -550,7 +550,7 @@ def train():
 
             eval_start_time = time.time()
 
-        if train_step >= args.max_step or cur_loss <=1.0:
+        if train_step >= args.max_step or prev_loss <=1.0:
             break
         
         if train_step % args.log_interval == 0:
