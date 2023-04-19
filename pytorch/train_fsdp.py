@@ -86,7 +86,6 @@ def train(args, model, rank, world_size, train_loader, valid_loader, optimizer, 
     prev_loss = 0
     start = time.time()
     for batch, (data, target) in enumerate(train_loader):
-        if rank==1: print(batch,end="")
         data, target = data.T.to(rank), target.T.to(rank)
         
         # Ensure that the batch axis of data matches that of mem
@@ -143,7 +142,6 @@ def train(args, model, rank, world_size, train_loader, valid_loader, optimizer, 
             log_obj.update({"goodput": log_obj["throughput"] * log_obj["stat_eff"]})
             wandb.log(log_obj)
             prev_loss = cur_loss
-            print("Duration:", time.time()-start)
             
         if train_step % args.eval_interval == 0:
             evaluate(model, rank, world_size, valid_loader, train_step, optimizer, args)
@@ -154,6 +152,9 @@ def train(args, model, rank, world_size, train_loader, valid_loader, optimizer, 
         if train_step % args.log_interval == 0:
             ddp_loss = torch.zeros(1).to(rank)
             init_start_event.record()
+            
+        if train_step >= args.max_step:
+            break
 
 
 def evaluate(model, rank, world_size, test_loader, train_step, optimizer, args):
@@ -175,7 +176,6 @@ def evaluate(model, rank, world_size, test_loader, train_step, optimizer, args):
     with torch.no_grad():
         mems = tuple()
         for i, (data, target) in enumerate(test_loader):
-            # print(i,end=" ")
             if args.max_eval_steps > 0 and i >= args.max_eval_steps:
                 break
             ret = model(data, target, *mems)
@@ -291,7 +291,6 @@ def fsdp_main(rank, world_size, args, corpus):
     if rank == lead_device:
         logging = create_exp_dir(args.work_dir)
         logging(f"CUDA event elapsed time: {init_start_event.elapsed_time(init_end_event) / 1000}sec")
-        # print(f"{model}")
 
     cleanup()
     
