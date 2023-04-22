@@ -1,0 +1,40 @@
+wandb_version: 1
+
+learning_rate:
+  desc: null
+  value: 0.00025
+learning_rate_cosine_scheduler:
+  desc: null
+  value: 0.0
+architecture:
+  desc: null
+  value: transformer-xl
+dataset:
+  desc: null
+  value: enwik8
+epochs:
+  desc: null
+  value: 1
+_wandb:
+  desc: null
+  value:
+    python_version: 3.8.16
+    cli_version: 0.15.0
+    framework: torch
+    is_jupyter_run: false
+    is_kaggle_kernel: false
+    start_time: 1682172407.775474
+    t:
+      1:
+      - 1
+      - 55
+      2:
+      - 1
+      - 55
+      3:
+      - 16
+      - 23
+      4: 3.8.16
+      5: 0.15.0
+      8:
+      - 5

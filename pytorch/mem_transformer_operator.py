@@ -1,5 +1,6 @@
 import sys
 import math
+import time
 import functools
 
 import numpy as np
@@ -10,6 +11,7 @@ import torch.nn.functional as F
 
 from utils.proj_adaptive_softmax import ProjectedAdaptiveLogSoftmax
 from utils.log_uniform_sampler import LogUniformSampler, sample_logits
+from train import wandb
 
 
 class PositionalEmbedding(nn.Module):
@@ -339,19 +341,13 @@ class RelPartialLearnableMultiHeadAttn(nn.Module):
 
         #### compute attention score
         rw_head_q = w_head_q + r_w_bias  # qlen x bsz x n_head x d_head
-        # print(rw_head_q.shape, w_head_k.shape)
         AC = torch.einsum('ibnd,jbnd->ijbn', (rw_head_q, w_head_k))  # qlen x klen x bsz x n_head
-        # print(rw_head_q.shape, w_head_k.shape)
 
         rr_head_q = w_head_q + r_r_bias
-        # print(rr_head_q.shape, r_head_k.shape)
         BD = torch.einsum('ibnd,jnd->ijbn', (rr_head_q, r_head_k))  # qlen x klen x bsz x n_head
         BD = self._rel_shift(BD)
-        # print(rr_head_q.shape, r_head_k.shape)
 
         # [qlen x klen x bsz x n_head]
-        # print(AC.shape)
-        # print(BD.shape)
         attn_score = AC + BD
         attn_score.mul_(self.scale)
 
@@ -533,6 +529,7 @@ class RelPartialLearnableDecoderLayerFirst(nn.Module):
         self.mem = mem.to(self.cuda)
 
     def forward(self, data):
+        forward_start_time = time.now()
         output = self.dec_attn(data, 
             self.pos_emb, 
             self.r_w_bias,
@@ -541,8 +538,10 @@ class RelPartialLearnableDecoderLayerFirst(nn.Module):
             self.mem,
         )
         output = self.pos_ff(output)
+        wandb.log({
+            f"train/{self.index}-layer": time.time() - forward_start_time
+        })
         
-        # print(output.shape)
         return output, torch.clone(output)
 
 
@@ -571,15 +570,8 @@ class RelPartialLearnableDecoderLayer(nn.Module):
 
     def forward(self, data_and_skip):
         data, skip = data_and_skip
-        # print(self.index)
-        # print(
-        #     data.get_device(), 
-        #     self.pos_emb.get_device(),
-        #     self.r_w_bias.get_device(),
-        #     self.r_r_bias.get_device(),
-        #     self.dec_attn_mask.get_device(),
-        #     self.mem,)
 
+        forward_start_time = time.now()
         output = self.dec_attn(
             data, 
             self.pos_emb, 
@@ -588,13 +580,12 @@ class RelPartialLearnableDecoderLayer(nn.Module):
             self.dec_attn_mask,
             self.mem,
         )
-        # print(self.index)
         output = self.pos_ff(output)
+        wandb.log({
+            f"train/{self.index}-layer": time.time() - forward_start_time
+        })
         output = output.to(data.get_device())
-        # print(output.shape)
         skip = torch.cat((skip, output), 0)
-        # print('skip connection')
-        # print(self.index)
 
         return output, skip
 
@@ -617,18 +608,10 @@ class AdaptiveEmbedding(nn.Module):
 
         self.emb_layers = nn.ModuleList()
         self.emb_projs = nn.ParameterList()
-        # print('###############')
-        # print(n_token)
-        # print(d_embed)
-        # print(sample_softmax)
-        # print(d_proj != d_embed)
-        # print(d_proj)
-        # print(d_embed)
         if div_val == 1:
             self.emb_layers.append(
                 nn.Embedding(n_token, d_embed, sparse=sample_softmax>0)
             )
-            # print(self.params)
             if d_proj != d_embed:
                 self.emb_projs.append(nn.Parameter(torch.Tensor(d_proj, d_embed)))
         else:
@@ -638,10 +621,7 @@ class AdaptiveEmbedding(nn.Module):
                 self.emb_layers.append(nn.Embedding(r_idx-l_idx, d_emb_i))
                 self.emb_projs.append(nn.Parameter(torch.Tensor(d_proj, d_emb_i)))
 
-    def forward(self, inp):
-        # print(list(self.emb_layers[0].parameters()))
-        # print(self.params)
-        
+    def forward(self, inp):        
         if self.div_val == 1:
             embed = self.emb_layers[0](inp)
             if self.d_proj != self.d_embed:
@@ -668,8 +648,6 @@ class AdaptiveEmbedding(nn.Module):
 
             embed = emb_flat.view(*inp.size(), self.d_proj)
 
-        # print(embed)
-        # a = 0 - None
         embed.mul_(self.emb_scale)
 
         return embed
@@ -717,7 +695,6 @@ class MemTransformerLM(nn.Module):
         self.layers = []
         self._create_params()
         if self.attn_type == 0:  # the default attention
-            # print('0 layer')
             self.layers.append(RelPartialLearnableDecoderLayerFirst(
                         self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
                         tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
@@ -727,7 +704,6 @@ class MemTransformerLM(nn.Module):
                     )
             for i in range(1, self.n_layer):
                 if self.pipeline_devices == 2:
-                    #print(f'{i} layer')
                     temp_cuda = 'cuda:0'
                     device2 = None
                     if i == self.n_layer // 2 - 1:
@@ -938,10 +914,6 @@ class MemTransformerLM(nn.Module):
     def _update_mems(self, hids, mems, qlen, mlen):
         # does not deal with None
         if mems is None: return None
-
-        # mems is not None
-        # print(len(hids))
-        # print(len(mems))
         assert len(hids) == len(mems), 'len(hids) != len(mems)'
 
         # There are `mlen + qlen` steps that can be cached into mems
@@ -954,8 +926,6 @@ class MemTransformerLM(nn.Module):
             end_idx = mlen + max(0, qlen - 0 - self.ext_len)
             beg_idx = max(0, end_idx - self.mem_len)
             for i in range(len(hids)):
-                # print(mems[i])
-                # print(hids[i])
                 cat = torch.cat([mems[i], hids[i]], dim=0)
                 new_mems.append(cat[beg_idx:end_idx].detach())
 
@@ -967,7 +937,6 @@ class MemTransformerLM(nn.Module):
         word_emb = self.word_emb(dec_inp)
 
         mlen = mems[0].size(0) if mems is not None else 0
-        # print(mlen)
         klen = mlen + qlen
         if self.same_length:
             all_ones = word_emb.new_ones(qlen, klen)
@@ -1026,7 +995,11 @@ class MemTransformerLM(nn.Module):
 
             #########################################################################################################
             # input_ = first_core_out.to(in_device, non_blocking=True)
+            pipeline_start_time = time.time()
             core_out, hidden_states = self.gpipe_model(core_out)
+            wandb.log({
+                "train/pipeline_time": time.time() - log_start_time
+            })
             hidden_states = hidden_states.view(self.n_layer, *first_core_out.shape)
             hids = hids + [hid_state.to('cuda:0') for hid_state in hidden_states]
 
