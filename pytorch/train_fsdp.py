@@ -318,10 +318,6 @@ def fsdp_main(rank, world_size, args, corpus):
     cleanup()
     
     
-def move_to(mems, device="cpu"):
-    index_queue = multiprocessing.Queue()
-    
-    return mems
 if __name__ == '__main__':
     args = arguments()
     logging = create_exp_dir(args.work_dir, scripts_to_save=['train.py', 'mem_transformer.py'], debug=args.debug)
