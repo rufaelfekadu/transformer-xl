@@ -16,6 +16,8 @@ from mem_transformer_operator import MemTransformerLM
 from utils.exp_utils import create_exp_dir
 from utils.data_parallel import BalancedDataParallel
 
+# import wandb
+
 parser = argparse.ArgumentParser(description='PyTorch Transformer Language Model')
 parser.add_argument('--data', type=str, default='../data/wikitext-103',
                     help='location of the data corpus')
@@ -179,7 +181,7 @@ if args.fp16:  # fp16 is the mode for training? I saw this in stable diffusion p
             print('WARNING: apex not installed, ignoring --fp16 option')
             args.fp16 = False
 
-device = torch.device('cuda:1' if args.cuda else 'cpu')
+device = torch.device('cuda:0' if args.cuda else 'cpu')
 
 ###############################################################################
 # Load data
@@ -394,7 +396,9 @@ logging('#params = {}'.format(args.n_all_param))
 
 def evaluate(eval_iter):
     # Turn on evaluation mode which disables dropout.
+    print('started eval')
     model.eval()
+    print('finished eval')
 
     # If the model does not use memory at all, make the ext_len longer.
     # Otherwise, make the mem_len longer and keep the ext_len the same.
@@ -408,22 +412,52 @@ def evaluate(eval_iter):
     # Evaluation
     total_len, total_loss = 0, 0.
     with torch.no_grad():
+        print('torch no grad')
         mems = tuple()
+        last_iteration = len(eval_iter) - 1
         for i, (data, target, seq_len) in enumerate(eval_iter):
             if args.max_eval_steps > 0 and i >= args.max_eval_steps:
                 break
             ret = model(data, target, *mems)
+
             loss, mems = ret[0], ret[1:]
             loss = loss.mean()
             total_loss += seq_len * loss.float().item()
             total_len += seq_len
 
+            # if i == last_iteration:
+            #     log_table(data, target, ret)
+
     # Switch back to the training mode
+    print('model reset')
     model.reset_length(args.tgt_len, args.ext_len, args.mem_len)
+    
+    print('model train')
     model.train()
+    print('done')
 
     return total_loss / total_len
 
+# wandb.init(
+#     # set the wandb project where this run will be logged
+#     project="ml710-project-pipeline-parallelism",
+    
+#     # track hyperparameters and run metadata
+#     config={
+#         "learning_rate": args.lr,
+#         "learning_rate_cosine_scheduler": args.eta_min
+#         "architecture": "transformer-xl",
+#         "dataset": args.dataset,
+#         "epochs": 1,
+#     }
+# )
+
+# def log_table(text, true_text, predicted_text):
+#     "Log a wandb.Table with (img, pred, target, scores)"
+#     table = wandb.Table(columns=["data", "pred", "target"])
+#     for img, pred, targ, prob in zip(images.to("cpu"), predicted.to("cpu"), labels.to("cpu")):
+#         table.add_data(text, true_text, predicted_text)
+#     wandb.log({"predictions_table":table}, commit=False)
 
 def train():
     # Turn on training mode which enables dropout.
@@ -471,6 +505,7 @@ def train():
 
         # step-wise learning rate annealing
         train_step += 1
+        # print(train_step)
         if args.scheduler in ['cosine', 'constant', 'dev_perf']:
             # linear warmup stage
             if train_step < args.warmup_step:
@@ -501,8 +536,16 @@ def train():
             train_loss = 0
             log_start_time = time.time()
 
+            # wandb.log({
+            #     "ms/batch": elapsed * 1000 / args.log_interval 
+            #     "loss": cur_loss, 
+            #     "bpc": cur_loss / math.log(2)
+            # })
+
         if train_step % args.eval_interval == 0:
+            print('validation start')
             val_loss = evaluate(va_iter)
+            print('validation end')
             logging('-' * 100)
             log_str = '| Eval {:3d} at step {:>8d} | time: {:5.2f}s ' \
                       '| valid loss {:5.2f}'.format(
@@ -514,6 +557,13 @@ def train():
                 log_str += ' | valid ppl {:9.3f}'.format(math.exp(val_loss))
             logging(log_str)
             logging('-' * 100)
+
+            # wandb.log({
+            #     "time_val": (time.time() - eval_start_time) 
+            #     "loss_val": val_loss, 
+            #     "bpc_val": val_loss / math.log(2)
+            # })
+
             # Save the model if the validation loss is the best we've seen so far.
             if not best_val_loss or val_loss < best_val_loss:
                 if not args.debug:
@@ -530,7 +580,6 @@ def train():
                     scheduler_sparse.step(val_loss)
 
             eval_start_time = time.time()
-
         if train_step == args.max_step:
             break
 
@@ -545,18 +594,22 @@ eval_start_time = time.time()
 # At any point you can hit Ctrl + C to break out of training early.
 try:
     for epoch in itertools.count(start=1):
+        print('starting')
         train()
         if train_step == args.max_step:
             logging('-' * 100)
             logging('End of training')
             break
+        print('end of one epoch')
 except KeyboardInterrupt:
     logging('-' * 100)
     logging('Exiting from training early')
+    # wandb.finish()
 
+# wandb.finish()
 # Load the best saved model.
-with open(os.path.join(args.work_dir, 'model.pt'), 'rb') as f:
-    model = torch.load(f)
+# with open(os.path.join(args.work_dir, 'model.pt'), 'rb') as f:
+#     model = torch.load(f)
 para_model = model.to(device)
 
 # Run on test data.

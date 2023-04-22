@@ -216,7 +216,6 @@ class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
 
     def forward(self, w, r, r_w_bias, r_r_bias, attn_mask=None, mems=None):
         qlen, rlen, bsz = w.size(0), r.size(0), w.size(1)
-
         if mems is not None:
             cat = torch.cat([mems, w], 0)
             if self.pre_lnorm:
@@ -253,8 +252,6 @@ class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
         BD = self._rel_shift(BD)
 
         # [qlen x klen x bsz x n_head]
-        # print(AC.shape)
-        # print(BD.shape)
         attn_score = AC + BD
         attn_score.mul_(self.scale)
 
@@ -462,9 +459,10 @@ class AdaptiveEmbedding(nn.Module):
                 self.emb_layers.append(nn.Embedding(r_idx-l_idx, d_emb_i))
                 self.emb_projs.append(nn.Parameter(torch.Tensor(d_proj, d_emb_i)))
 
-    def forward(self, inp):
+    def forward(self, inp):    
         if self.div_val == 1:
             embed = self.emb_layers[0](inp)
+            
             if self.d_proj != self.d_embed:
                 embed  = F.linear(embed, self.emb_projs[0])
         else:
@@ -646,9 +644,7 @@ class MemTransformerLM(nn.Module):
         word_emb = self.word_emb(dec_inp)
 
         mlen = mems[0].size(0) if mems is not None else 0
-        # print(mlen)
         klen = mlen + qlen
-        # print(klen)
         if self.same_length:
             all_ones = word_emb.new_ones(qlen, klen)
             mask_len = klen - self.mem_len
@@ -662,6 +658,7 @@ class MemTransformerLM(nn.Module):
             dec_attn_mask = torch.triu(
                 word_emb.new_ones(qlen, klen), diagonal=1+mlen).byte()[:,:,None]
 
+        
         hids = []
         if self.attn_type == 0: # default
             pos_seq = torch.arange(klen-1, -1, -1.0, device=word_emb.device, 
@@ -732,7 +729,6 @@ class MemTransformerLM(nn.Module):
                 hids.append(core_out)
 
         core_out = self.drop(core_out)
-        # print([hid_state.get_device() for hid_state in hids])
 
         new_mems = self._update_mems(hids, mems, mlen, qlen)
 

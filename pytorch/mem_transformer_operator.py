@@ -11,8 +11,6 @@ import torch.nn.functional as F
 from utils.proj_adaptive_softmax import ProjectedAdaptiveLogSoftmax
 from utils.log_uniform_sampler import LogUniformSampler, sample_logits
 
-device = 'cuda:0'
-
 
 class PositionalEmbedding(nn.Module):
     def __init__(self, demb):
@@ -38,7 +36,7 @@ class PositionalEmbedding(nn.Module):
 class PositionwiseFF(nn.Module):
     # The output of the Position-wise Feedforward Network for each position is then added to the output
     # of the multi-head attention module in a residual connection.
-    def __init__(self, d_model, d_inner, dropout, pre_lnorm=False):
+    def __init__(self, d_model, d_inner, dropout, pre_lnorm=False, **kwargs):
         super(PositionwiseFF, self).__init__()
 
         self.d_model = d_model
@@ -46,10 +44,10 @@ class PositionwiseFF(nn.Module):
         self.dropout = dropout
 
         self.CoreNet = nn.Sequential(
-            nn.Linear(d_model, d_inner),
+            nn.Linear(d_model, d_inner, device=kwargs['device']),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(d_inner, d_model),
+            nn.Linear(d_inner, d_model, device=kwargs['device']),
             nn.Dropout(dropout),
         )
 
@@ -77,6 +75,7 @@ class PositionwiseFF(nn.Module):
         else:
             ##### positionwise feed-forward
             core_out = self.CoreNet(inp)
+            core_out = core_out.to(inp.get_device())
 
             ##### residual connection + layer normalization
             output = self.layer_norm(inp + core_out)
@@ -191,6 +190,77 @@ class RelMultiHeadAttn(nn.Module):
     def _parallelogram_mask(self, h, w, left=False):
         mask = torch.ones((h, w)).byte()
         m = min(h, w)
+        mask[:m,:m] = torch.triu(mask[:m,:m])
+        mask[-m:,-m:] = torch.tril(mask[-m:,-m:])
+
+        if left:
+            return mask
+        else:
+            return mask.flip(0)
+
+    def _shift(self, x, qlen, klen, mask, left=False):
+        if qlen > 1:
+            zero_pad = torch.zeros((x.size(0), qlen-1, x.size(2), x.size(3)),
+                                    device=x.device, dtype=x.dtype)
+        else:
+            zero_pad = torch.zeros(0, device=x.device, dtype=x.dtype)
+
+        if left:
+            mask = mask.flip(1)
+            x_padded = torch.cat([zero_pad, x], dim=1).expand(qlen, -1, -1, -1)
+        else:
+            x_padded = torch.cat([x, zero_pad], dim=1).expand(qlen, -1, -1, -1)
+
+        x = x_padded.masked_select(mask[:,:,None,None]) \
+                    .view(qlen, klen, x.size(2), x.size(3))
+
+        return x
+
+    def _rel_shift(self, x, zero_triu=False):
+        zero_pad = torch.zeros((x.size(0), 1, *x.size()[2:]),
+                               device=x.device, dtype=x.dtype)
+        x_padded = torch.cat([zero_pad, x], dim=1)
+
+        x_padded = x_padded.view(x.size(1) + 1, x.size(0), *x.size()[2:])
+
+        x = x_padded[1:].view_as(x)
+
+        if zero_triu:
+            ones = torch.ones((x.size(0), x.size(1)))
+            x = x * torch.tril(ones, x.size(1) - x.size(0))[:,:,None,None]
+
+        return x
+
+    def forward(self, w, r, attn_mask=None, mems=None):
+        raise NotImplementedError
+
+
+class RelPartialLearnableMultiHeadAttn(nn.Module):
+    def __init__(self, n_head, d_model, d_head, dropout, **kwargs):
+        super(RelPartialLearnableMultiHeadAttn, self).__init__()
+        
+        self.n_head = n_head
+        self.d_model = d_model
+        self.d_head = d_head
+        self.dropout = dropout
+
+        self.r_net = nn.Linear(self.d_model, self.n_head * self.d_head, bias=False, device=kwargs['device'])
+
+        self.qkv_net = nn.Linear(d_model, 3 * n_head * d_head, bias=False, device=kwargs['device'])
+
+        self.drop = nn.Dropout(dropout)
+        self.dropatt = nn.Dropout(kwargs.get('dropatt', 0))
+        self.o_net = nn.Linear(n_head * d_head, d_model, bias=False, device=kwargs['device'])
+
+        self.layer_norm = nn.LayerNorm(d_model, device=kwargs['device'])
+
+        self.scale = 1 / (d_head ** 0.5)
+
+        self.pre_lnorm = kwargs.get('pre_lnorm', False)
+
+    def _parallelogram_mask(self, h, w, left=False):
+        mask = torch.ones((h, w)).byte()
+        m = min(h, w)
         mask[:m, :m] = torch.triu(mask[:m, :m])
         mask[-m:, -m:] = torch.tril(mask[-m:, -m:])
 
@@ -232,27 +302,18 @@ class RelMultiHeadAttn(nn.Module):
 
         return x
 
-    def forward(self, w, r, attn_mask=None, mems=None):
-        raise NotImplementedError
-
-
-class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
-    def __init__(self, *args, **kwargs):
-        super(RelPartialLearnableMultiHeadAttn, self).__init__(*args, **kwargs)
-
-        self.r_net = nn.Linear(self.d_model, self.n_head * self.d_head, bias=False)
-
     def forward(self, w, r, r_w_bias, r_r_bias, attn_mask=None, mems=None):
         qlen, rlen, bsz = w.size(0), r.size(0), w.size(1)
 
-        # print(mems)
         if mems is not None:
             cat = torch.cat([mems, w], 0)
             if self.pre_lnorm:
                 w_heads = self.qkv_net(self.layer_norm(cat))
             else:
                 w_heads = self.qkv_net(cat)
+            w_heads = w_heads.to(w.get_device())
             r_head_k = self.r_net(r)
+            r_head_k = r_head_k.to(w.get_device())
 
             w_head_q, w_head_k, w_head_v = torch.chunk(w_heads, 3, dim=-1)
             w_head_q = w_head_q[-qlen:]
@@ -261,7 +322,10 @@ class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
                 w_heads = self.qkv_net(self.layer_norm(w))
             else:
                 w_heads = self.qkv_net(w)
+
+            w_heads = w_heads.to(w.get_device())
             r_head_k = self.r_net(r)
+            r_head_k = r_head_k.to(w.get_device())
 
             w_head_q, w_head_k, w_head_v = torch.chunk(w_heads, 3, dim=-1)
 
@@ -314,6 +378,7 @@ class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
         ##### linear projection
         attn_out = self.o_net(attn_vec)
         attn_out = self.drop(attn_out)
+        attn_out = attn_out.to(w.get_device())
 
         if self.pre_lnorm:
             ##### residual connection
@@ -321,6 +386,7 @@ class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
         else:
             ##### residual connection + layer normalization
             output = self.layer_norm(w + attn_out)
+        output = output.to(w.get_device())
 
         return output
 
@@ -417,7 +483,7 @@ class DecoderLayer(nn.Module):
 
         self.dec_attn = MultiHeadAttn(n_head, d_model, d_head, dropout, **kwargs)
         self.pos_ff = PositionwiseFF(d_model, d_inner, dropout,
-                                     pre_lnorm=kwargs.get('pre_lnorm'))
+                                     pre_lnorm=kwargs.get('pre_lnorm'), **kwargs)
 
     def forward(self, dec_inp, dec_attn_mask=None, mems=None):
         output = self.dec_attn(dec_inp, attn_mask=dec_attn_mask,
@@ -433,9 +499,9 @@ class RelLearnableDecoderLayer(nn.Module):
         super(RelLearnableDecoderLayer, self).__init__()
 
         self.dec_attn = RelLearnableMultiHeadAttn(n_head, d_model, d_head, dropout,
-                                                  **kwargs)
+                                                  **kwargs).to(kwargs['device'])
         self.pos_ff = PositionwiseFF(d_model, d_inner, dropout,
-                                     pre_lnorm=kwargs.get('pre_lnorm'))
+                                     pre_lnorm=kwargs.get('pre_lnorm'), **kwargs)
 
     def forward(self, dec_inp, r_emb, r_w_bias, r_bias, dec_attn_mask=None, mems=None):
 
@@ -449,72 +515,92 @@ class RelLearnableDecoderLayer(nn.Module):
 
 class RelPartialLearnableDecoderLayerFirst(nn.Module):
     def __init__(self, n_head, d_model, d_head, d_inner, dropout, index,
-                pos_emb, r_w_bias, r_r_bias, dec_attn_mask, mem,
-                 **kwargs):
+                cuda, **kwargs):
         super().__init__()
-
         self.dec_attn = RelPartialLearnableMultiHeadAttn(n_head, d_model,
-                                                         d_head, dropout, **kwargs)
+                                                         d_head, dropout, **kwargs).to(cuda)
         self.pos_ff = PositionwiseFF(d_model, d_inner, dropout,
-                                     pre_lnorm=kwargs.get('pre_lnorm'))
+                                      **kwargs)
         self.index = index
 
-        self.pos_emb = pos_emb
-        self.r_w_bias = r_w_bias
-        self.r_r_bias = r_r_bias
-        self.dec_attn_mask = dec_attn_mask
-        self.mem = mem
+        self.cuda = cuda
+
+    def initialize_additional_vars(self, pos_emb, dec_attn_mask, r_w_bias, r_r_bias, mem):
+        self.pos_emb = pos_emb.to(self.cuda)
+        self.dec_attn_mask = dec_attn_mask.to(self.cuda)
+        self.r_w_bias = r_w_bias.to(self.cuda)
+        self.r_r_bias = r_r_bias.to(self.cuda)
+        self.mem = mem.to(self.cuda)
 
     def forward(self, data):
-        # print('memory', self.mem)
-        output = self.dec_attn(data, self.pos_emb[0], self.r_w_bias[0], self.r_r_bias[0],
-                               attn_mask=self.dec_attn_mask[0],
-                               mems=self.mem)
+        output = self.dec_attn(data, 
+            self.pos_emb, 
+            self.r_w_bias,
+            self.r_r_bias,
+            self.dec_attn_mask,
+            self.mem,
+        )
         output = self.pos_ff(output)
+        
         # print(output.shape)
-        return output, torch.tensor(output)
+        return output, torch.clone(output)
 
 
 class RelPartialLearnableDecoderLayer(nn.Module):
     def __init__(self, n_head, d_model, d_head, d_inner, dropout, index,
-                pos_emb, r_w_bias, r_r_bias, dec_attn_mask, mem,
+                cuda,
                  **kwargs):
         super().__init__()
 
         self.dec_attn = RelPartialLearnableMultiHeadAttn(n_head, d_model,
                                                          d_head, dropout, **kwargs)
         self.pos_ff = PositionwiseFF(d_model, d_inner, dropout,
-                                     pre_lnorm=kwargs.get('pre_lnorm'))
+                                     **kwargs)
         self.index = index
 
-        self.pos_emb = pos_emb
-        self.r_w_bias = r_w_bias
-        self.r_r_bias = r_r_bias
-        self.dec_attn_mask = dec_attn_mask
-        self.mem = mem
+        
+
+        self.cuda = cuda
+
+    def initialize_additional_vars(self, pos_emb, dec_attn_mask, r_w_bias, r_r_bias, mem):
+        self.pos_emb = pos_emb.to(self.cuda)
+        self.dec_attn_mask = dec_attn_mask.to(self.cuda)
+        self.r_w_bias = r_w_bias.to(self.cuda)
+        self.r_r_bias = r_r_bias.to(self.cuda)
+        self.mem = mem.to(self.cuda)
 
     def forward(self, data_and_skip):
-        # print(f'{self.index} layer forward')
         data, skip = data_and_skip
-        # print(data.get_device())
-        # print(self.pos_emb[0].get_device())
-        # print(self.r_w_bias[0].get_device())
-        # print(self.r_r_bias[0].get_device())
-        # print(self.dec_attn_mask[0].get_device())
-        # print(self.mem.get_device())
+        # print(self.index)
+        # print(
+        #     data.get_device(), 
+        #     self.pos_emb.get_device(),
+        #     self.r_w_bias.get_device(),
+        #     self.r_r_bias.get_device(),
+        #     self.dec_attn_mask.get_device(),
+        #     self.mem,)
 
-        output = self.dec_attn(data, self.pos_emb[0], self.r_w_bias[0], self.r_r_bias[0],
-                               attn_mask=self.dec_attn_mask[0],
-                               mems=self.mem)
+        output = self.dec_attn(
+            data, 
+            self.pos_emb, 
+            self.r_w_bias,
+            self.r_r_bias,
+            self.dec_attn_mask,
+            self.mem,
+        )
+        # print(self.index)
         output = self.pos_ff(output)
+        output = output.to(data.get_device())
         # print(output.shape)
         skip = torch.cat((skip, output), 0)
+        # print('skip connection')
+        # print(self.index)
 
         return output, skip
 
 
 class AdaptiveEmbedding(nn.Module):
-    def __init__(self, n_token, d_embed, d_proj, cutoffs, div_val=1,
+    def __init__(self, n_token, d_embed, d_proj, cutoffs, div_val=1, 
                  sample_softmax=False):
         super(AdaptiveEmbedding, self).__init__()
 
@@ -531,29 +617,40 @@ class AdaptiveEmbedding(nn.Module):
 
         self.emb_layers = nn.ModuleList()
         self.emb_projs = nn.ParameterList()
+        # print('###############')
+        # print(n_token)
+        # print(d_embed)
+        # print(sample_softmax)
+        # print(d_proj != d_embed)
+        # print(d_proj)
+        # print(d_embed)
         if div_val == 1:
             self.emb_layers.append(
-                nn.Embedding(n_token, d_embed, sparse=sample_softmax > 0)
+                nn.Embedding(n_token, d_embed, sparse=sample_softmax>0)
             )
+            # print(self.params)
             if d_proj != d_embed:
                 self.emb_projs.append(nn.Parameter(torch.Tensor(d_proj, d_embed)))
         else:
             for i in range(len(self.cutoffs)):
-                l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i + 1]
+                l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i+1]
                 d_emb_i = d_embed // (div_val ** i)
-                self.emb_layers.append(nn.Embedding(r_idx - l_idx, d_emb_i))
+                self.emb_layers.append(nn.Embedding(r_idx-l_idx, d_emb_i))
                 self.emb_projs.append(nn.Parameter(torch.Tensor(d_proj, d_emb_i)))
 
     def forward(self, inp):
+        # print(list(self.emb_layers[0].parameters()))
+        # print(self.params)
+        
         if self.div_val == 1:
             embed = self.emb_layers[0](inp)
             if self.d_proj != self.d_embed:
-                embed = F.linear(embed, self.emb_projs[0])
+                embed  = F.linear(embed, self.emb_projs[0])
         else:
             param = next(self.parameters())
             inp_flat = inp.view(-1)
-            emb_flat = torch.zeros([inp_flat.size(0), self.d_proj],
-                                   dtype=param.dtype, device=param.device)
+            emb_flat = torch.zeros([inp_flat.size(0), self.d_proj], 
+                dtype=param.dtype, device=param.device)
             for i in range(len(self.cutoffs)):
                 l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i + 1]
 
@@ -571,13 +668,11 @@ class AdaptiveEmbedding(nn.Module):
 
             embed = emb_flat.view(*inp.size(), self.d_proj)
 
+        # print(embed)
+        # a = 0 - None
         embed.mul_(self.emb_scale)
 
         return embed
-
-class Cache:
-    def __init__():
-        pass
     
 
 
@@ -588,7 +683,7 @@ class MemTransformerLM(nn.Module):
                  tgt_len=None, ext_len=None, mem_len=None,
                  cutoffs=[], adapt_inp=False,
                  same_length=False, attn_type=0, clamp_len=-1,
-                 sample_softmax=-1, pipeline_devices=2):
+                 sample_softmax=-1, pipeline_devices=4):
         super(MemTransformerLM, self).__init__()
         self.n_token = n_token
 
@@ -597,12 +692,13 @@ class MemTransformerLM(nn.Module):
         self.d_model = d_model
         self.n_head = n_head
         self.d_head = d_head
+
         self.dropout = dropout
         self.d_inner = d_inner
         self.dropatt = dropatt
         self.pre_lnorm = pre_lnorm
 
-        self.word_emb = AdaptiveEmbedding(n_token, d_embed, d_model, cutoffs,
+        self.word_emb = AdaptiveEmbedding(n_token, d_embed, d_model, cutoffs, 
                                           div_val=div_val)
 
         self.drop = nn.Dropout(dropout)
@@ -618,6 +714,158 @@ class MemTransformerLM(nn.Module):
         self.attn_type = attn_type
 
         self.pipeline_devices = pipeline_devices
+        self.layers = []
+        self._create_params()
+        if self.attn_type == 0:  # the default attention
+            # print('0 layer')
+            self.layers.append(RelPartialLearnableDecoderLayerFirst(
+                        self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
+                        tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
+                        dropatt=self.dropatt, pre_lnorm=self.pre_lnorm, index=0,
+                        cuda='cuda:0', device='cuda:0'
+                        ).to('cuda:0')
+                    )
+            for i in range(1, self.n_layer):
+                if self.pipeline_devices == 2:
+                    #print(f'{i} layer')
+                    temp_cuda = 'cuda:0'
+                    device2 = None
+                    if i == self.n_layer // 2 - 1:
+                        device2 = 'cuda:1'
+                    else:
+                        device2 = None
+
+                    if i >= self.n_layer // 2:
+                        temp_cuda = 'cuda:1'
+                        self.layers.append(
+                            RelPartialLearnableDecoderLayer(
+                                self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
+                                tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
+                                dropatt=self.dropatt, pre_lnorm=self.pre_lnorm, index=i, 
+                                cuda=temp_cuda, device=temp_cuda
+                            ).to(temp_cuda)
+                        )
+                elif self.pipeline_devices == 3:
+                    temp_cuda1 = 'cuda:0'
+                    temp_cuda2 = 'cuda:1'
+                    temp_cuda3 = 'cuda:2'
+                    if i < self.n_layer // 3:
+
+                        self.layers.append(
+                            RelPartialLearnableDecoderLayer(
+                                self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
+                                tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
+                                dropatt=self.dropatt, pre_lnorm=self.pre_lnorm, index=i,
+                                cuda=temp_cuda1, device=temp_cuda1
+                            ).to(temp_cuda1)
+                        )
+                    elif self.n_layer // 3 <= i < 2 * self.n_layer // 3:
+                        self.layers.append(
+                            RelPartialLearnableDecoderLayer(
+                                self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
+                                tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
+                                dropatt=self.dropatt, pre_lnorm=self.pre_lnorm, index=i,
+                                cuda=temp_cuda2, device=temp_cuda2
+                            ).to(temp_cuda2)
+                        )
+                    else:
+                        self.layers.append(
+                            RelPartialLearnableDecoderLayer(
+                                self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
+                                tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
+                                dropatt=self.dropatt, pre_lnorm=self.pre_lnorm, index=i,
+                                cuda=temp_cuda3, device=temp_cuda3
+                            ).to(temp_cuda3)
+                        )
+                else:
+                    temp_cuda1 = 'cuda:0'
+                    temp_cuda2 = 'cuda:1'
+                    temp_cuda3 = 'cuda:2'
+                    temp_cuda4 = 'cuda:3'
+                    if i < self.n_layer // 4:
+
+                        self.layers.append(
+                            RelPartialLearnableDecoderLayer(
+                                self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
+                                tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
+                                dropatt=self.dropatt, pre_lnorm=self.pre_lnorm, index=i,
+                                cuda=temp_cuda1, device=temp_cuda1
+                            ).to(temp_cuda1)
+                        )
+                    elif self.n_layer // 4 <= i < 2 * self.n_layer // 4:
+                        self.layers.append(
+                            RelPartialLearnableDecoderLayer(
+                                self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
+                                tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
+                                dropatt=self.dropatt, pre_lnorm=self.pre_lnorm, index=i,
+                                cuda=temp_cuda2, device=temp_cuda2
+                            ).to(temp_cuda2)
+                        )
+                    elif 2 * self.n_layer // 4 <= i < 3 * self.n_layer // 4:
+                        self.layers.append(
+                            RelPartialLearnableDecoderLayer(
+                                self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
+                                tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
+                                dropatt=self.dropatt, pre_lnorm=self.pre_lnorm, index=i,
+                                cuda=temp_cuda3, device=temp_cuda3
+                            ).to(temp_cuda3)
+                        )
+                    else:
+                        self.layers.append(
+                            RelPartialLearnableDecoderLayer(
+                                self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
+                                tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
+                                dropatt=self.dropatt, pre_lnorm=self.pre_lnorm, index=i,
+                                cuda=temp_cuda4, device=temp_cuda4
+                            ).to(temp_cuda4)
+                        )
+
+        elif self.attn_type == 1:  # learnable embeddings
+            for i in range(self.n_layer):
+                self.layers.append(
+                    RelLearnableDecoderLayer(
+                        self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
+                        tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
+                        dropatt=self.dropatt, pre_lnorm=self.pre_lnorm,
+                    )
+                )
+        elif self.attn_type in [2, 3]:  # absolute embeddings
+            for i in range(self.n_layer):
+                self.layers.append(
+                    DecoderLayer(
+                        self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
+                        dropatt=self.dropatt, pre_lnorm=self.pre_lnorm,
+                    )
+                )
+
+        
+        from torchgpipe import GPipe
+        self.nn_sequential_model = nn.Sequential(*self.layers)
+
+        if self.pipeline_devices == 2:
+            self.gpipe_model = GPipe(
+                self.nn_sequential_model,
+                balance=[self.n_layer // 2, self.n_layer - self.n_layer//2],
+                devices=[1, 2],
+                checkpoint='never',
+                chunks=1
+            )
+        elif self.pipeline_devices == 3:
+            self.gpipe_model = GPipe(
+                self.nn_sequential_model,
+                balance=[self.n_layer // 3, self.n_layer // 3, self.n_layer - 2 * (self.n_layer // 3)],
+                devices=[0, 1, 2],
+                checkpoint='never',
+                chunks=1
+            )
+        else:
+            self.gpipe_model = GPipe(
+                self.nn_sequential_model,
+                balance=[self.n_layer // 4, self.n_layer // 4, self.n_layer // 4, self.n_layer - 3 * (self.n_layer // 4)],
+                devices=[0, 1, 2, 3],
+                checkpoint='never',
+                chunks=1
+            )
         #####
 
         self.sample_softmax = sample_softmax
@@ -648,7 +896,6 @@ class MemTransformerLM(nn.Module):
         self.same_length = same_length
         self.clamp_len = clamp_len
 
-        self._create_params()
 
     def backward_compatible(self):
         self.sample_softmax = -1
@@ -734,7 +981,6 @@ class MemTransformerLM(nn.Module):
         else:
             dec_attn_mask = torch.triu(
                 word_emb.new_ones(qlen, klen), diagonal=1 + mlen).byte()[:, :, None]
-
         hids = []
         if self.attn_type == 0:  # default
             pos_seq = torch.arange(klen - 1, -1, -1.0, device=word_emb.device,
@@ -748,73 +994,17 @@ class MemTransformerLM(nn.Module):
 
             #########################################################################################################
             #########################################################################################################
-            layers = nn.ModuleList()
             hids.append(core_out)
-            if self.attn_type == 0:  # the default attention
-                # print('0 layer')
-                layers.append(RelPartialLearnableDecoderLayerFirst(
-                            self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
-                            tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
-                            dropatt=self.dropatt, pre_lnorm=self.pre_lnorm, index=0,
-                            pos_emb=torch.clone(pos_emb), r_w_bias=torch.clone(self.r_w_bias), r_r_bias=torch.clone(self.r_r_bias), dec_attn_mask=torch.clone(dec_attn_mask), mem=mems[0]
-                            ).to('cuda:1')
-                        )
-                for i in range(1, self.n_layer):
-                    #print(f'{i} layer')
-                    temp_cuda = 'cuda:1'
-                    if i >= self.n_layer // 2:
-                        temp_cuda = 'cuda:2'
-                    layers.append(
-                        RelPartialLearnableDecoderLayer(
-                            self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
-                            tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
-                            dropatt=self.dropatt, pre_lnorm=self.pre_lnorm, index=i,
-                            pos_emb=torch.clone(pos_emb).to(temp_cuda), 
-                            r_w_bias=torch.clone(self.r_w_bias).to(temp_cuda), 
-                            r_r_bias=torch.clone(self.r_r_bias).to(temp_cuda), 
-                            dec_attn_mask=torch.clone(dec_attn_mask).to(temp_cuda), 
-                            mem=mems[i].to(temp_cuda)
-                        ).to(temp_cuda)
-                    )
 
-            elif self.attn_type == 1:  # learnable embeddings
-                for i in range(self.n_layer):
-                    layers.append(
-                        RelLearnableDecoderLayer(
-                            self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
-                            tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
-                            dropatt=self.dropatt, pre_lnorm=self.pre_lnorm,
-                            pos_emb=torch.clone(pos_emb), r_w_bias=torch.clone(self.r_w_bias), r_r_bias=torch.clone(self.r_r_bias), dec_attn_mask=torch.clone(dec_attn_mask), mem=mems[i]
-                        )
-                    )
-            elif self.attn_type in [2, 3]:  # absolute embeddings
-                for i in range(self.n_layer):
-                    layers.append(
-                        DecoderLayer(
-                            self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
-                            dropatt=self.dropatt, pre_lnorm=self.pre_lnorm,
-                            pos_emb=torch.clone(pos_emb), r_w_bias=torch.clone(self.r_w_bias), r_r_bias=torch.clone(self.r_r_bias), dec_attn_mask=torch.clone(dec_attn_mask), mem=mems[i]
-                        )
-                    )
-
+            for i, layer in enumerate(self.layers):
+                layer.initialize_additional_vars(
+                    torch.clone(pos_emb), 
+                    torch.clone(dec_attn_mask), 
+                    torch.clone(self.r_w_bias), 
+                    torch.clone(self.r_r_bias), 
+                    torch.clone(mems[i])
+                )
             
-            from torchgpipe import GPipe
-            self.nn_sequential_model = nn.Sequential(*layers)
-
-            if self.pipeline_devices == 2:
-                self.gpipe_model = GPipe(
-                    self.nn_sequential_model,
-                    balance=[self.n_layer // 2, self.n_layer - self.n_layer//2],
-                    devices=[1, 2],
-                    chunks=1
-                )
-            else:
-                self.gpipe_model = GPipe(
-                    self.nn_sequential_model,
-                    balance=[self.n_layer // 3, self.n_layer // 3, self.n_layer - 2 * (self.n_layer // 3)],
-                    devices=[1, 2, 3],
-                    chunks=1
-                )
 
             # RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cuda:1 and cuda:2! 
             # (when checking argument for argument mat2 in method wrapper_CUDA_mm
@@ -838,7 +1028,7 @@ class MemTransformerLM(nn.Module):
             # input_ = first_core_out.to(in_device, non_blocking=True)
             core_out, hidden_states = self.gpipe_model(core_out)
             hidden_states = hidden_states.view(self.n_layer, *first_core_out.shape)
-            hids = hids + [hid_state.to('cuda:1') for hid_state in hidden_states]
+            hids = hids + [hid_state.to('cuda:0') for hid_state in hidden_states]
 
             #########################################################################################################
 
@@ -909,7 +1099,7 @@ class MemTransformerLM(nn.Module):
 
         tgt_len = target.size(0)
         hidden, new_mems = self._forward(data, mems=mems)
-        hidden = hidden.to('cuda:1')
+        hidden = hidden.to('cuda:0')
 
         pred_hid = hidden[-tgt_len:]
         if self.sample_softmax > 0 and self.training:
