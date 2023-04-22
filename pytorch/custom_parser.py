@@ -132,6 +132,11 @@ def arguments():
                         help='Parallel sharding strategy')
     parser.add_argument('--wrap', action='store_true',
                         help='Run in fp16 mode.')
+    parser.add_argument('--port', type=str, default="12355", help="Port to initialize process group on")
+    parser.add_argument('--chkpt', action='store_true',
+                        help='Checkpoint activations and recalculate in the backward pass.')
+    parser.add_argument('--mem_offload', action='store_true',
+                        help='Offload `mems` values to cpu before backward pass.')
     args = parser.parse_args()
     args.tied = not args.not_tied
     

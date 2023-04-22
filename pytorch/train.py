@@ -428,7 +428,7 @@ train_loader = DataLoader(dataset = corpus.get_dataset("train", args.tgt_len), b
 valid_loader = DataLoader(dataset = corpus.get_dataset("train", args.eval_tgt_len), batch_size=eval_batch_size)
 test_loader = DataLoader(dataset = corpus.get_dataset("test", args.eval_tgt_len), batch_size=eval_batch_size)
 #####################################################
-wandb = init_wandb(f"baseline_{args.timestamp}", args)
+wandb = init_wandb(f"base_bs-{args.batch_size}_dev-{torch.cuda.device_count()}_fp16-{args.fp16}", args)
 
 def train():
     # Turn on training mode which enables dropout.
@@ -507,7 +507,7 @@ def train():
                 log_str += ' | ppl {:9.3f}'.format(math.exp(cur_loss))
             logging(log_str)
             log_obj = {
-                "train_loss":loss, 
+                "train_loss":cur_loss, 
                 "train_step":train_step, 
                 "iter_duration":elapsed/args.log_interval,
                 "throughput": (train_loader.batch_size)/(elapsed / args.log_interval),
@@ -550,7 +550,7 @@ def train():
 
             eval_start_time = time.time()
 
-        if train_step >= args.max_step or prev_loss <=1.0:
+        if (train_step >= args.max_step or prev_loss <=1.0) and prev_loss!=0:
             break
         
         if train_step % args.log_interval == 0:

@@ -9,9 +9,10 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 import itertools
-
+import multiprocessing as python_multiprocessing
 
 from torch.optim.lr_scheduler import StepLR
+import torch.multiprocessing as multiprocessing
 
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -24,6 +25,11 @@ from torch.distributed.fsdp import (
     BackwardPrefetch,
     ShardingStrategy,
     CPUOffload
+)
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,
+    CheckpointImpl,
+   apply_activation_checkpointing,
 )
 from torch.distributed.fsdp.wrap import (
     size_based_auto_wrap_policy,
@@ -57,10 +63,10 @@ def init_model(args):
     model.word_emb.apply(weights_init)
     return model
 
-def setup(rank, world_size):
+def setup(rank, world_size, port=None):
     import random
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = "12355"#f"{123}{random.randint(10,99)}"
+    os.environ['MASTER_PORT'] = port or "12356"
 
     # initialize the process group
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
@@ -69,7 +75,7 @@ def cleanup():
     dist.destroy_process_group()
     
     
-def train(args, model, rank, world_size, train_loader, valid_loader, optimizer, scheduler, epoch, wandb, sampler=None):
+def train(args, model: MemTransformerLM, rank, world_size, train_loader, valid_loader, optimizer, scheduler, epoch, wandb, sampler=None):
     global train_step_, logging
     model.train()
     ddp_loss = torch.zeros(1).to(rank)
@@ -83,26 +89,30 @@ def train(args, model, rank, world_size, train_loader, valid_loader, optimizer, 
     # barrier_end = torch.cuda.Event(True)
     
     init_start_event.record()
-    prev_loss = 0
+    cur_loss = prev_loss = 0
     start = time.time()
+    data: torch.Tensor
     for batch, (data, target) in enumerate(train_loader):
-        data, target = data.T.to(rank), target.T.to(rank)
-        
+        data, target = data.T.to(rank, non_blocking=True), target.T.to(rank, non_blocking=True)
+        # data.bfloat16()
         # Ensure that the batch axis of data matches that of mem
-        mems = tuple(mem[:, :data.size(1), :].to(rank) for mem in mems)
+        # st = time.time()
+        mems = tuple(mem[:, :data.size(1), :].to(rank, non_blocking=True) for mem in mems)
         model.zero_grad()
         
         ret = model(data, target, *mems)
         loss, mems = ret[0], ret[1:]
+        if args.mem_offload:
+            mems = tuple(mem.to("cpu", non_blocking=True).pin_memory() for i, mem in enumerate(mems))
+        # print(torch.cuda.memory_allocated()/2**30)
         loss = loss.float().mean().type_as(loss)
         loss.backward()
+        # print("Total duration:", time.time()-st, torch.cuda.memory_allocated()/2**30, torch.cuda.max_memory_allocated()/2**30)
             
         ddp_loss[0] += loss.item()
 
-        if args.fp16:
-            optimizer.clip_master_grads(args.clip)
-        else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
 
         optimizer.step()
 
@@ -117,13 +127,13 @@ def train(args, model, rank, world_size, train_loader, valid_loader, optimizer, 
                 scheduler.step()
 
         
-        dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM) if train_step % args.log_interval == 0 else None
-        
+        if train_step % args.log_interval == 0:
+            dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
+            cur_loss = ddp_loss[0] / args.log_interval / world_size
+            
         init_end_event.record()
         dist.barrier()
         if rank==lead_device and train_step % args.log_interval == 0:
-            cur_loss = ddp_loss[0] / args.log_interval
-            # if rank==lead_device:
             logging = create_exp_dir(args.work_dir)
             elapsed = init_start_event.elapsed_time(init_end_event)
             log_str = '| epoch {:3d} step {:>8d} | {:>6d} batches | lr {:.3g} ' \
@@ -133,7 +143,7 @@ def train(args, model, rank, world_size, train_loader, valid_loader, optimizer, 
             log_str += ' | bpc {:9.5f}'.format(cur_loss / math.log(2))
             logging(log_str)
             log_obj = {
-                "train_loss":loss, 
+                "train_loss":cur_loss, 
                 "train_step":train_step, 
                 "iter_duration":(elapsed/1000)/args.log_interval,
                 "throughput": (world_size * train_loader.batch_size)/(elapsed/ 1000 / args.log_interval),
@@ -153,8 +163,11 @@ def train(args, model, rank, world_size, train_loader, valid_loader, optimizer, 
             ddp_loss = torch.zeros(1).to(rank)
             init_start_event.record()
             
-        if prev_loss <= 1.0 or train_step >= args.max_step:
+        if (cur_loss <= 1.0 or train_step >= args.max_step) and cur_loss!=0:
             sys.exit()
+            
+        print("Max mem:", torch.cuda.max_memory_allocated()/2**30)
+        torch.cuda.empty_cache()
 
 
 def evaluate(model, rank, world_size, test_loader, train_step, optimizer, args):
@@ -176,6 +189,7 @@ def evaluate(model, rank, world_size, test_loader, train_step, optimizer, args):
     with torch.no_grad():
         mems = tuple()
         for i, (data, target) in enumerate(test_loader):
+            data, target = data.T.to(rank, non_blocking=True), target.T.to(rank, non_blocking=True)
             if args.max_eval_steps > 0 and i >= args.max_eval_steps:
                 break
             ret = model(data, target, *mems)
@@ -215,12 +229,14 @@ def evaluate(model, rank, world_size, test_loader, train_step, optimizer, args):
 
 def fsdp_main(rank, world_size, args, corpus):
     wandb=None
+    setup(rank, world_size, args.port)
+    run_name=f"{args.strategy}_bs-{args.batch_size}_ws-{world_size}_bfp-{args.fp16}" \
+            f"_wrap-{args.wrap}_chkpt-{args.chkpt}_offload-{args.mem_offload}".replace("True","Yes").replace("False","No")
     if rank==lead_device:
         wandb = init_wandb(
-            run_name=f"{args.strategy}_bs-{args.batch_size}_ws-{world_size}_bfp-{args.fp16}_wrap-{args.wrap}",
+            run_name=run_name,
             run_cfg=args
         )
-    setup(rank, world_size)
     
     train_dataset = corpus.get_dataset("train")
     valid_dataset = corpus.get_dataset("valid")
@@ -257,15 +273,19 @@ def fsdp_main(rank, world_size, args, corpus):
         auto_wrap_policy=args.wrap_obj,
         mixed_precision=args.fp16_obj
     )
+    
+    if args.chkpt:
+        non_reentrant_wrapper = functools.partial(
+            checkpoint_wrapper,
+            offload_to_cpu=False,
+            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+        )
+        check_fn = lambda submodule: isinstance(submodule, RelPartialLearnableDecoderLayer)
+        apply_activation_checkpointing(
+            model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn
+        )
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    # if args.cuda and args.fp16:
-    #     # If args.dynamic_loss_scale is False, static_loss_scale will be used.
-    #     # If args.dynamic_loss_scale is True, it will take precedence over static_loss_scale.
-    #     optimizer = FP16_Optimizer(optimizer,
-    #         static_loss_scale = args.static_loss_scale,
-    #         dynamic_loss_scale = args.dynamic_loss_scale,
-    #         dynamic_loss_args = {'init_scale': 2 ** 16})
 
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer,
         args.max_step, eta_min=args.eta_min)
@@ -298,6 +318,10 @@ def fsdp_main(rank, world_size, args, corpus):
     cleanup()
     
     
+def move_to(mems, device="cpu"):
+    index_queue = multiprocessing.Queue()
+    
+    return mems
 if __name__ == '__main__':
     args = arguments()
     logging = create_exp_dir(args.work_dir, scripts_to_save=['train.py', 'mem_transformer.py'], debug=args.debug)
@@ -316,7 +340,7 @@ if __name__ == '__main__':
     args.strategy_obj = sharding_strategy_map[args.strategy]
     
     bfSixteen = MixedPrecision(
-        param_dtype=torch.bfloat16,
+        # param_dtype=torch.bfloat16,
         # Gradient communication precision.
         reduce_dtype=torch.bfloat16,
         # Buffer precision.
@@ -325,7 +349,7 @@ if __name__ == '__main__':
     args.fp16_obj = bfSixteen if args.fp16 else None
     tx_xl_auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
-        transformer_layer_cls=RelPartialLearnableDecoderLayer
+        transformer_layer_cls={RelPartialLearnableDecoderLayer}
     )
     args.wrap_obj = tx_xl_auto_wrap_policy if args.wrap else None
     # Training settings
