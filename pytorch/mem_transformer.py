@@ -224,6 +224,7 @@ class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
                 w_heads = self.qkv_net(cat)
             r_head_k = self.r_net(r)
 
+            print(w_heads.shape)
             w_head_q, w_head_k, w_head_v = torch.chunk(w_heads, 3, dim=-1)
             w_head_q = w_head_q[-qlen:]
         else:

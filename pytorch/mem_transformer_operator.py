@@ -243,16 +243,17 @@ class RelPartialLearnableMultiHeadAttn(nn.Module):
         self.d_model = d_model
         self.d_head = d_head
         self.dropout = dropout
+        self.chunks = kwargs.get('chunks', 1)
 
-        self.r_net = nn.Linear(self.d_model, self.n_head * self.d_head, bias=False, device=kwargs['device'])
+        self.r_net = nn.Linear(d_model // kwargs['chunks'], self.n_head * self.d_head, bias=False, device=kwargs['device'], chunks=kwargs['chunks'], index=kwargs['index'])
 
-        self.qkv_net = nn.Linear(d_model, 3 * n_head * d_head, bias=False, device=kwargs['device'])
+        self.qkv_net = nn.Linear(d_model // kwargs['chunks'], 3 * n_head * d_head, bias=False, device=kwargs['device'], chunks=kwargs['chunks'], index=kwargs['index'])
 
         self.drop = nn.Dropout(dropout)
         self.dropatt = nn.Dropout(kwargs.get('dropatt', 0))
-        self.o_net = nn.Linear(n_head * d_head, d_model, bias=False, device=kwargs['device'])
+        self.o_net = nn.Linear(n_head * d_head // kwargs['chunks'], d_model, bias=False, device=kwargs['device'], chunks=kwargs['chunks'], index=kwargs['index'])
 
-        self.layer_norm = nn.LayerNorm(d_model, device=kwargs['device'])
+        self.layer_norm = nn.LayerNorm(d_model // kwargs['chunks'], device=kwargs['device'], chunks=kwargs['chunks'], index=kwargs['index'])
 
         self.scale = 1 / (d_head ** 0.5)
 
@@ -304,9 +305,11 @@ class RelPartialLearnableMultiHeadAttn(nn.Module):
 
     def forward(self, w, r, r_w_bias, r_r_bias, attn_mask=None, mems=None):
         qlen, rlen, bsz = w.size(0), r.size(0), w.size(1)
+        # print(mems)
 
         if mems is not None:
             cat = torch.cat([mems, w], 0)
+            # print(cat.shape)
             if self.pre_lnorm:
                 w_heads = self.qkv_net(self.layer_norm(cat))
             else:
@@ -315,8 +318,11 @@ class RelPartialLearnableMultiHeadAttn(nn.Module):
             r_head_k = self.r_net(r)
             r_head_k = r_head_k.to(w.get_device())
 
+            # print(w.shape)
+            # print(w_heads.shape)
             w_head_q, w_head_k, w_head_v = torch.chunk(w_heads, 3, dim=-1)
             w_head_q = w_head_q[-qlen:]
+            
         else:
             if self.pre_lnorm:
                 w_heads = self.qkv_net(self.layer_norm(w))
@@ -328,7 +334,8 @@ class RelPartialLearnableMultiHeadAttn(nn.Module):
             r_head_k = r_head_k.to(w.get_device())
 
             w_head_q, w_head_k, w_head_v = torch.chunk(w_heads, 3, dim=-1)
-
+        
+        # print(w_heads)
         klen = w_head_k.size(0)
 
         w_head_q = w_head_q.view(qlen, bsz, self.n_head, self.d_head)  # qlen x bsz x n_head x d_head
@@ -517,6 +524,7 @@ class RelPartialLearnableDecoderLayerFirst(nn.Module):
     def __init__(self, n_head, d_model, d_head, d_inner, dropout, index,
                 cuda, **kwargs):
         super().__init__()
+        kwargs['index'] = index
         self.dec_attn = RelPartialLearnableMultiHeadAttn(n_head, d_model,
                                                          d_head, dropout, **kwargs).to(cuda)
         self.pos_ff = PositionwiseFF(d_model, d_inner, dropout,
@@ -551,7 +559,7 @@ class RelPartialLearnableDecoderLayer(nn.Module):
                 cuda,
                  **kwargs):
         super().__init__()
-
+        kwargs['index'] = index
         self.dec_attn = RelPartialLearnableMultiHeadAttn(n_head, d_model,
                                                          d_head, dropout, **kwargs)
         self.pos_ff = PositionwiseFF(d_model, d_inner, dropout,
@@ -683,7 +691,7 @@ class MemTransformerLM(nn.Module):
                  tgt_len=None, ext_len=None, mem_len=None,
                  cutoffs=[], adapt_inp=False,
                  same_length=False, attn_type=0, clamp_len=-1,
-                 sample_softmax=-1, pipeline_devices=4):
+                 sample_softmax=-1, pipeline_devices=2):
         super(MemTransformerLM, self).__init__()
         self.n_token = n_token
 
@@ -716,33 +724,38 @@ class MemTransformerLM(nn.Module):
         self.pipeline_devices = pipeline_devices
         self.layers = []
         self._create_params()
+
+        self.chunks = 1
         if self.attn_type == 0:  # the default attention
             # print('0 layer')
             self.layers.append(RelPartialLearnableDecoderLayerFirst(
                         self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
                         tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
                         dropatt=self.dropatt, pre_lnorm=self.pre_lnorm, index=0,
-                        cuda='cuda:0', device='cuda:0'
+                        cuda='cuda:0', device='cuda:0', chunks=self.chunks
                         ).to('cuda:0')
                     )
             for i in range(1, self.n_layer):
                 if self.pipeline_devices == 2:
                     #print(f'{i} layer')
-                    temp_cuda = 'cuda:0'
-                    device2 = None
-                    if i == self.n_layer // 2 - 1:
-                        device2 = 'cuda:1'
+                    if i < self.n_layer // 2:
+                        temp_cuda = 'cuda:0'
+                        self.layers.append(
+                            RelPartialLearnableDecoderLayer(
+                                self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
+                                tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
+                                dropatt=self.dropatt, pre_lnorm=self.pre_lnorm, index=i, 
+                                cuda=temp_cuda, device=temp_cuda, chunks=self.chunks
+                            ).to(temp_cuda)
+                        )
                     else:
-                        device2 = None
-
-                    if i >= self.n_layer // 2:
                         temp_cuda = 'cuda:1'
                         self.layers.append(
                             RelPartialLearnableDecoderLayer(
                                 self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
                                 tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
                                 dropatt=self.dropatt, pre_lnorm=self.pre_lnorm, index=i, 
-                                cuda=temp_cuda, device=temp_cuda
+                                cuda=temp_cuda, device=temp_cuda, chunks=self.chunks
                             ).to(temp_cuda)
                         )
                 elif self.pipeline_devices == 3:
@@ -756,7 +769,7 @@ class MemTransformerLM(nn.Module):
                                 self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
                                 tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
                                 dropatt=self.dropatt, pre_lnorm=self.pre_lnorm, index=i,
-                                cuda=temp_cuda1, device=temp_cuda1
+                                cuda=temp_cuda1, device=temp_cuda1, chunks=self.chunks
                             ).to(temp_cuda1)
                         )
                     elif self.n_layer // 3 <= i < 2 * self.n_layer // 3:
@@ -765,7 +778,7 @@ class MemTransformerLM(nn.Module):
                                 self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
                                 tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
                                 dropatt=self.dropatt, pre_lnorm=self.pre_lnorm, index=i,
-                                cuda=temp_cuda2, device=temp_cuda2
+                                cuda=temp_cuda2, device=temp_cuda2, chunks=self.chunks
                             ).to(temp_cuda2)
                         )
                     else:
@@ -774,7 +787,7 @@ class MemTransformerLM(nn.Module):
                                 self.n_head, self.d_model, self.d_head, self.d_inner, self.dropout,
                                 tgt_len=self.tgt_len, ext_len=self.ext_len, mem_len=self.mem_len,
                                 dropatt=self.dropatt, pre_lnorm=self.pre_lnorm, index=i,
-                                cuda=temp_cuda3, device=temp_cuda3
+                                cuda=temp_cuda3, device=temp_cuda3, chunks=self.chunks
                             ).to(temp_cuda3)
                         )
                 else:
@@ -846,25 +859,25 @@ class MemTransformerLM(nn.Module):
             self.gpipe_model = GPipe(
                 self.nn_sequential_model,
                 balance=[self.n_layer // 2, self.n_layer - self.n_layer//2],
-                devices=[1, 2],
-                checkpoint='never',
-                chunks=1
+                devices=[0, 1],
+                # checkpoint='never',
+                chunks=self.chunks
             )
         elif self.pipeline_devices == 3:
             self.gpipe_model = GPipe(
                 self.nn_sequential_model,
                 balance=[self.n_layer // 3, self.n_layer // 3, self.n_layer - 2 * (self.n_layer // 3)],
                 devices=[0, 1, 2],
-                checkpoint='never',
-                chunks=1
+                # checkpoint='never',
+                chunks=self.chunks
             )
         else:
             self.gpipe_model = GPipe(
                 self.nn_sequential_model,
                 balance=[self.n_layer // 4, self.n_layer // 4, self.n_layer // 4, self.n_layer - 3 * (self.n_layer // 4)],
                 devices=[0, 1, 2, 3],
-                checkpoint='never',
-                chunks=1
+                # checkpoint='never',
+                chunks=self.chunks
             )
         #####
 
@@ -1027,8 +1040,32 @@ class MemTransformerLM(nn.Module):
             #########################################################################################################
             # input_ = first_core_out.to(in_device, non_blocking=True)
             core_out, hidden_states = self.gpipe_model(core_out)
-            hidden_states = hidden_states.view(self.n_layer, *first_core_out.shape)
-            hids = hids + [hid_state.to('cuda:0') for hid_state in hidden_states]
+            in_d = first_core_out.shape
+
+            new_skip_con = torch.empty((*first_core_out.shape), dtype=torch.float)
+            new_skip_con = new_skip_con.to('cuda:0')
+            skips = []
+            print(hidden_states.shape)
+            for i in range(hidden_states.shape[0]):
+                skips.append(hidden_states[i].to('cuda:0'))
+
+            chunk = self.chunks
+            for i in range(skips[0].shape[0]):
+                micro_batch = first_core_out.shape[0] // chunk
+                proper_skip = torch.cat(
+                    list(map(lambda x: x[i * micro_batch:(i + 1) * micro_batch, :, :], skips)),
+                    0
+                )
+                print(proper_skip.shape)
+                print(new_skip_con.shape)
+                new_skip_con = torch.cat((new_skip_con, proper_skip), 0)
+                
+            
+            new_skip_con = new_skip_con[in_d[0]:, :]
+            new_skip_tensor = new_skip_con.view(self.pipeline_devices, *input_data.shape)
+
+            
+            hids = hids + new_skip_tensor
 
             #########################################################################################################
 

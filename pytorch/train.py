@@ -414,7 +414,7 @@ def evaluate(eval_iter):
     with torch.no_grad():
         print('torch no grad')
         mems = tuple()
-        last_iteration = len(eval_iter) - 1
+        # last_iteration = len(eval_iter) - 1
         for i, (data, target, seq_len) in enumerate(eval_iter):
             if args.max_eval_steps > 0 and i >= args.max_eval_steps:
                 break
