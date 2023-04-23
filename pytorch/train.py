@@ -16,7 +16,7 @@ from mem_transformer_operator import MemTransformerLM
 from utils.exp_utils import create_exp_dir
 from utils.data_parallel import BalancedDataParallel
 
-import wandb
+from wandb_logs import wandb, wandb_init, log_table, gpu_table
 
 parser = argparse.ArgumentParser(description='PyTorch Transformer Language Model')
 parser.add_argument('--data', type=str, default='../data/wikitext-103',
@@ -146,6 +146,8 @@ parser.add_argument('--dynamic-loss-scale', action='store_true',
 args = parser.parse_args()  # argument parser, collects input from the user
 args.tied = not args.not_tied  # tied and untied word embeddings with softmax
 # TODO identify the reason of word embedding tied
+
+wandb_init(args)
 
 if args.d_embed < 0:  # user preferred embedding size
     args.d_embed = args.d_model
@@ -422,7 +424,7 @@ def evaluate(eval_iter):
             total_loss += seq_len * loss.float().item()
             total_len += seq_len
 
-        log_table(data, target, ret)
+        # log_table(data, target, ret)
 
     # Switch back to the training mode
     model.reset_length(args.tgt_len, args.ext_len, args.mem_len)
@@ -430,28 +432,6 @@ def evaluate(eval_iter):
     model.train()
 
     return total_loss / total_len
-
-wandb.init(
-    # set the wandb project where this run will be logged
-    project="ml710-project-pipeline-parallelism",
-    
-    # track hyperparameters and run metadata
-    config={
-        "learning_rate": args.lr,
-        "learning_rate_cosine_scheduler": args.eta_min,
-        "architecture": "transformer-xl",
-        "dataset": args.dataset,
-        "epochs": 1,
-        tags=["gpus - 4"]
-    }
-)
-
-def log_table(text, true_text, predicted_text):
-    "Log a wandb.Table with (img, pred, target, scores)"
-    table = wandb.Table(columns=["data", "pred", "target"])
-    for img, pred, targ, prob in zip(text.to("cpu"), predicted.to("cpu"), labels.to("cpu")):
-        table.add_data(text, true_text, predicted_text)
-    wandb.log({"predictions_table":table}, commit=False)
 
 def train():
     # Turn on training mode which enables dropout.
@@ -589,12 +569,23 @@ try:
         if train_step == args.max_step:
             logging('-' * 100)
             break
+
+    wandb.log({"gpu_table":gpu_table}, commit=False)
+    wandb.finish()
 except KeyboardInterrupt:
     logging('-' * 100)
     logging('Exiting from training early')
+    wandb.log({"gpu_table":gpu_table}, commit=False)
+    # wandb.log({"predictions_table":table}, commit=False)
+    wandb.finish()
+except:
+    logging('-' * 100)
+    logging('Error')
+    wandb.log({"gpu_table":gpu_table}, commit=False)
+    # wandb.log({"predictions_table":table}, commit=False)
     wandb.finish()
 
-wandb.finish()
+# wandb.log({"predictions_table":table}, commit=False)
 # Load the best saved model.
 # with open(os.path.join(args.work_dir, 'model.pt'), 'rb') as f:
 #     model = torch.load(f)

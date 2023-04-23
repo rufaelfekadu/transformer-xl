@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from utils.proj_adaptive_softmax import ProjectedAdaptiveLogSoftmax
 from utils.log_uniform_sampler import LogUniformSampler, sample_logits
-from train import wandb
+from wandb_logs import log_gpu_table
 
 
 class PositionalEmbedding(nn.Module):
@@ -529,7 +529,7 @@ class RelPartialLearnableDecoderLayerFirst(nn.Module):
         self.mem = mem.to(self.cuda)
 
     def forward(self, data):
-        forward_start_time = time.now()
+        forward_start_time = time.time()
         output = self.dec_attn(data, 
             self.pos_emb, 
             self.r_w_bias,
@@ -538,11 +538,9 @@ class RelPartialLearnableDecoderLayerFirst(nn.Module):
             self.mem,
         )
         output = self.pos_ff(output)
-        wandb.log({
-            f"train/{self.index}-layer": time.time() - forward_start_time
-        })
+        times = torch.tensor([time.time() - forward_start_time]).to(self.cuda)
         
-        return output, torch.clone(output)
+        return output, torch.clone(output), times[None, :]
 
 
 class RelPartialLearnableDecoderLayer(nn.Module):
@@ -568,10 +566,10 @@ class RelPartialLearnableDecoderLayer(nn.Module):
         self.r_r_bias = r_r_bias.to(self.cuda)
         self.mem = mem.to(self.cuda)
 
-    def forward(self, data_and_skip):
-        data, skip = data_and_skip
+    def forward(self, data_and_skip_and_time):
+        data, skip, layer_time = data_and_skip_and_time
 
-        forward_start_time = time.now()
+        forward_start_time = time.time()
         output = self.dec_attn(
             data, 
             self.pos_emb, 
@@ -581,13 +579,12 @@ class RelPartialLearnableDecoderLayer(nn.Module):
             self.mem,
         )
         output = self.pos_ff(output)
-        wandb.log({
-            f"train/{self.index}-layer": time.time() - forward_start_time
-        })
         output = output.to(data.get_device())
+        time_elapsed = torch.tensor([time.time() - forward_start_time]).to(self.cuda)
+        layer_time = torch.cat((layer_time, time_elapsed[None, :]), 0)
         skip = torch.cat((skip, output), 0)
 
-        return output, skip
+        return output, skip, layer_time
 
 
 class AdaptiveEmbedding(nn.Module):
@@ -996,10 +993,9 @@ class MemTransformerLM(nn.Module):
             #########################################################################################################
             # input_ = first_core_out.to(in_device, non_blocking=True)
             pipeline_start_time = time.time()
-            core_out, hidden_states = self.gpipe_model(core_out)
-            wandb.log({
-                "train/pipeline_time": time.time() - log_start_time
-            })
+            core_out, hidden_states, layers_time = self.gpipe_model(core_out)
+            pipeline_after_time = time.time() - pipeline_start_time
+            log_gpu_table(layers_time.view(self.n_layer).detach().tolist(), pipeline_after_time)
             hidden_states = hidden_states.view(self.n_layer, *first_core_out.shape)
             hids = hids + [hid_state.to('cuda:0') for hid_state in hidden_states]
 
