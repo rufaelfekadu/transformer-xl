@@ -147,7 +147,7 @@ def train(args, model: MemTransformerLM, rank, world_size, train_loader, valid_l
                 "train_step":train_step, 
                 "iter_duration":(elapsed/1000)/args.log_interval,
                 "throughput": (world_size * train_loader.batch_size)/(elapsed/ 1000 / args.log_interval),
-                "stat_eff": abs(prev_loss - cur_loss)/args.log_interval,
+                "stat_eff": abs(prev_loss - cur_loss)/(args.log_interval * train_loader.batch_size * world_size),
                 "samples_processed": train_step * train_loader.batch_size * world_size}
             log_obj.update({"goodput": log_obj["throughput"] * log_obj["stat_eff"]})
             wandb.log(log_obj)
@@ -163,7 +163,7 @@ def train(args, model: MemTransformerLM, rank, world_size, train_loader, valid_l
             ddp_loss = torch.zeros(1).to(rank)
             init_start_event.record()
             
-        if (cur_loss <= 1.0 or train_step >= args.max_step) and cur_loss!=0:
+        if (0 != cur_loss <= 1.0 or train_step >= args.max_step):
             sys.exit()
             
         print("Max mem:", torch.cuda.max_memory_allocated()/2**30)
@@ -299,6 +299,7 @@ def fsdp_main(rank, world_size, args, corpus):
             train(args, model, rank, world_size, train_loader, valid_loader, optimizer, scheduler, epoch, wandb, train_sampler)
         except SystemExit:
             print("Ending training...")
+            break
         dist.barrier()
         init_end_event.record()
         if rank==lead_device:
