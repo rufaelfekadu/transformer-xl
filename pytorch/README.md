@@ -1,3 +1,7 @@
+>Note: we extend the original implementation of Transformer-XL to support fully-sharded data parallel. We will leave the rest of the instruction from the original implementation as they can still be run in this codebase. However, we will add instruction to run FSDP under the `Training and Evaluation` sub-heading.
+
+Please note that the goal of the parallel implementation is not to get a result comparable to the SOTA from the original implementation.
+
 ## Introduction
 
 This directory contains our pytorch implementation of Transformer-XL. Note that our state-of-the-art results reported in the paper were obtained by training the model on a large-scale TPU cluster, and our pytorch codebase currently does not support distributed training. Here we provide two sets of hyperparameters and scripts:
@@ -17,6 +21,23 @@ The pytorch implementation produces similar results to the TF codebase under the
 `bash getdata.sh`
 
 ## Training and Evaluation
+
+### Run training using 4 Nvidia A100-SXM
+
+```
+bash run_fsdp_large.sh train --multi_gpu --eval-interval 500 --log-interval 100 \
+    --max_eval_steps 332 --max_step 2000 --batch_size 112 --port 12356 \
+    --wrap --chkpt;
+```
+If you have access to larger GPUs or more devices, you try even higher batch sizes. It scales linearly.
+
+### Run training using 1 Nvidia A100-SXM
+
+```
+bash run_fsdp_large.sh train --no-multi_gpu --eval-interval 500 --log-interval 100 \
+    --max_eval_steps 80 --max_step 2000 --batch_size 112 --port 12356 \
+    --wrap --chkpt;
+```
 
 #### Replicate the "bpc = 1.06" result on `enwik8` with a 12-layer Transformer-XL
 

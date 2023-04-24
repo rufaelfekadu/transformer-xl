@@ -1,34 +1,34 @@
-# Transformer-XL: Attentive Language Models Beyond a Fixed-Length Context
+# Fully-Sharded Data Parallel Transformer-XL
 
-This repository contains the code in both **PyTorch** and **TensorFlow** for our paper
->[Transformer-XL: Attentive Language Models Beyond a Fixed-Length Context](http://arxiv.org/abs/1901.02860)
+This repository extends the implementation of Transformer-XL to fully-sharded data parallel.
 
->Zihang Dai\*, Zhilin Yang\*, Yiming Yang, Jaime Carbonell, Quoc V. Le, Ruslan Salakhutdinov (*: equal contribution)
+The original implementation can be found here:
+> [Transformer-XL: Attentive Language Models Beyond a Fixed-Length Context](https://github.com/kimiyoung/transformer-xl).
 
->Preprint 2018
-
-## TensorFlow
-
-- The source code is in the `tf/` folder, supporting (1) single-node multi-gpu training, and (2) multi-host TPU training.
-- Besides the source code, we also provide pretrained "TensorFlow" models with state-of-the-art (SoTA) performances reported in the paper.
-- Please refer to `tf/README.md` for details.
-
+Our implementation focuses on the Pytorch implementation
 ## PyTorch
 
-- The source code is in the `pytorch/` folder, supporting single-node multi-gpu training via the module `nn.DataParallel`.
+- The source code is in the `pytorch/` folder, supporting single-node multi-gpu training via the modules `nn.DataParallel` (original implementation), and `distributed.FullyShardedDataParallel`.
 - Please refer to `pytorch/README.md` for details.
 
 ## Results
 
-Transformer-XL achieves new state-of-the-art results on multiple language modeling benchmarks. Transformer-XL is also the first to break through the 1.0 barrier on char-level language modeling. Below is a summary.
+We use 40GB NVIDIA A100 SXM GPUs. We tested with 1 device and 4 devices on a single node. We report the following performace improvements below:
 
-Method | enwiki8 | text8 | One Billion Word | WT-103 | PTB (w/o finetuning)
--- | -- | -- | -- | -- | -- 
-Previous Best | 1.06 | 1.13 | 23.7 | 20.5 | 55.5
-Transformer-XL | **0.99** | **1.08** | **21.8** | **18.3** | **54.5**
+### Single Device FSDP
+![single device result](images/one-device.png)
 
+#### Key Findings:
+- FSDP with “no_shard” (DDP), “grad_op” (ZeRO Stage 2) and “full_shard” (ZeRO stage 3) have identical memory footprints. This is because sharding cannot happen on a single device.
+- “chkpt” (activation checkpointing) gives the highest boost to the memory footprint, allowing for upto 6x increase in batch.
+- “wrap” (wraping decoder layers) and “fp16” together gave a negligible boost to the maximum batch size
+- 9x increase in batch size from the baseline
 
+### Multi-device (4) FSDP
+![multi device result](images/multi-device.png)
 
-## Acknowledgement
-
-A large portion of the `getdata.sh` script comes from the [awd-lstm](https://github.com/salesforce/awd-lstm-lm/) repo. Happy Language Modeling :)
+#### Key Findings:
+- FSDP with “grad_op” (ZeRO Stage 2) and “full_shard” (ZeRO stage 3) have identical memory footprints. This is likely due to the size of the parameter being modest (277Mn), so sharding it does not give significant memory gain
+- “chkpt” (activation checkpointing) gives the highest boost to the memory footprint, allowing for upto 4x batch size.
+- “wrap” (wraping decoder layers) does not give a boost when activation checkpointing is not used.
+- 10x increase in batch size over baseline
